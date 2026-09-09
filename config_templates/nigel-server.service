@@ -1,0 +1,13 @@
+[Unit]
+Description=Nigel Server Captive Portal Backend
+After=network.target
+
+[Service]
+User=root
+WorkingDirectory=/opt/nigel-server/backend
+Environment="PATH=/opt/nigel-server/venv/bin"
+ExecStart=/opt/nigel-server/venv/bin/python app.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
