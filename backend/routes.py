@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from flask_login import login_user, logout_user, login_required, current_user
 from models import User, Device, Voucher, Setting, RegisteredService
-from app import db
+from extensions import db
 import network
 import datetime
 

@@ -1,13 +1,5 @@
 from flask import Flask
-from flask_sqlalchemy import SQLAlchemy
-from flask_socketio import SocketIO
-from flask_login import LoginManager
-from flask_bcrypt import Bcrypt
-
-db = SQLAlchemy()
-socketio = SocketIO(cors_allowed_origins="*")
-login_manager = LoginManager()
-bcrypt = Bcrypt()
+from extensions import db, socketio, login_manager, bcrypt
 
 def create_app(config_object=None):
     app = Flask(__name__, static_folder='../frontend/dist', static_url_path='/')
