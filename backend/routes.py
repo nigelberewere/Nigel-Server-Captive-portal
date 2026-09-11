@@ -7,6 +7,22 @@ import datetime
 
 api_bp = Blueprint('api', __name__)
 
+@api_bp.route('/auth/register', methods=['POST'])
+def register():
+    data = request.get_json()
+    username = data.get('username')
+    password = data.get('password')
+    
+    if User.query.filter_by(username=username).first():
+        return jsonify({'message': 'Username already exists'}), 400
+        
+    # By default, new registrations are NOT approved
+    new_user = User(username=username, role='user', is_approved=False)
+    new_user.set_password(password)
+    db.session.add(new_user)
+    db.session.commit()
+    return jsonify({'message': 'Registration successful. Waiting for admin approval.'}), 201
+
 @api_bp.route('/auth/login', methods=['POST'])
 def login():
     data = request.get_json()
@@ -16,6 +32,10 @@ def login():
     
     user = User.query.filter_by(username=username).first()
     if user and user.check_password(password):
+        # Admin is always approved, check is_approved for others
+        if user.role != 'admin' and not user.is_approved:
+            return jsonify({'message': 'Account pending admin approval.'}), 403
+            
         login_user(user)
         
         # If MAC is provided, authenticate the device
@@ -167,3 +187,104 @@ def get_devices():
             'user': d.user.username if d.user else 'Guest'
         })
     return jsonify(res), 200
+
+# User Management Endpoints
+@api_bp.route('/admin/users', methods=['GET', 'POST'])
+@login_required
+def admin_users():
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+        
+    if request.method == 'GET':
+        users = User.query.all()
+        return jsonify([{
+            'id': u.id, 'username': u.username, 'role': u.role, 
+            'is_approved': u.is_approved, 'created_at': u.created_at.isoformat()
+        } for u in users]), 200
+        
+    if request.method == 'POST':
+        data = request.get_json()
+        if User.query.filter_by(username=data['username']).first():
+            return jsonify({'message': 'Username exists'}), 400
+            
+        u = User(username=data['username'], role=data.get('role', 'user'), is_approved=True)
+        u.set_password(data['password'])
+        db.session.add(u)
+        db.session.commit()
+        return jsonify({'message': 'User created'}), 201
+
+@api_bp.route('/admin/users/<int:user_id>/approve', methods=['POST'])
+@login_required
+def approve_user(user_id):
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    u = User.query.get(user_id)
+    if u:
+        u.is_approved = True
+        db.session.commit()
+        return jsonify({'message': 'Approved'}), 200
+    return jsonify({'message': 'Not found'}), 404
+
+@api_bp.route('/admin/users/<int:user_id>', methods=['DELETE'])
+@login_required
+def delete_user(user_id):
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    u = User.query.get(user_id)
+    if u:
+        db.session.delete(u)
+        db.session.commit()
+        return jsonify({'message': 'Deleted'}), 200
+    return jsonify({'message': 'Not found'}), 404
+
+# Voucher Management Endpoints
+import random
+import string
+
+def generate_voucher_code(length=8):
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+@api_bp.route('/admin/vouchers', methods=['GET', 'POST'])
+@login_required
+def admin_vouchers():
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+        
+    if request.method == 'GET':
+        vouchers = Voucher.query.all()
+        return jsonify([{
+            'id': v.id, 'code': v.code, 'used_by_device': v.used_by_device,
+            'created_at': v.created_at.isoformat(), 
+            'expires_at': v.expires_at.isoformat() if v.expires_at else None
+        } for v in vouchers]), 200
+        
+    if request.method == 'POST':
+        data = request.get_json()
+        count = data.get('count', 1)
+        duration_hours = data.get('duration_hours', 24)
+        
+        codes = []
+        for _ in range(count):
+            code = generate_voucher_code()
+            v = Voucher(
+                code=code, 
+                duration_hours=duration_hours,
+                expires_at=datetime.datetime.utcnow() + datetime.timedelta(hours=duration_hours)
+            )
+            db.session.add(v)
+            codes.append(code)
+            
+        db.session.commit()
+        return jsonify({'message': f'{count} vouchers created', 'codes': codes}), 201
+
+@api_bp.route('/admin/vouchers/<int:v_id>', methods=['DELETE'])
+@login_required
+def delete_voucher(v_id):
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    v = Voucher.query.get(v_id)
+    if v:
+        db.session.delete(v)
+        db.session.commit()
+        return jsonify({'message': 'Deleted'}), 200
+    return jsonify({'message': 'Not found'}), 404

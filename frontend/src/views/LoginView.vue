@@ -46,17 +46,17 @@
       
       <form @submit.prevent="handleRequest" v-if="mode === 'request'">
         <div class="input-group">
-          <label>Your Name</label>
-          <input type="text" v-model="requestData.name" required placeholder="How should we call you?" />
+          <label>Desired Username</label>
+          <input type="text" v-model="requestData.username" required placeholder="Choose a username" />
         </div>
         <div class="input-group">
-          <label>Reason / Note (Optional)</label>
-          <input type="text" v-model="requestData.note" placeholder="E.g. visiting for the weekend" />
+          <label>Password</label>
+          <input type="password" v-model="requestData.password" required placeholder="Choose a password" />
         </div>
         <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
         <div v-if="successMsg" class="success-msg">{{ successMsg }}</div>
         <button type="submit" class="btn w-full mt-4" :disabled="loading || successMsg">
-          {{ loading ? 'Sending...' : 'Request Access' }}
+          {{ loading ? 'Sending...' : 'Request Account' }}
         </button>
         <div class="mt-4 text-center text-sm">
           <a href="#" @click.prevent="mode = 'login'">Back to Login</a>
@@ -79,7 +79,7 @@ const successMsg = ref('')
 
 const loginData = ref({ username: '', password: '' })
 const voucherCode = ref('')
-const requestData = ref({ name: '', note: '' })
+const requestData = ref({ username: '', password: '' })
 
 // In a real captive portal scenario, the OS usually appends a MAC or IP in the redirect URL
 // For this demo, we'll try to extract it from query params or let backend handle it by IP
@@ -134,11 +134,25 @@ async function handleVoucher() {
 async function handleRequest() {
   loading.value = true
   errorMsg.value = ''
-  // Mock request flow
-  setTimeout(() => {
-    successMsg.value = 'Access requested. Please wait for the admin to approve your device.'
+  successMsg.value = ''
+  try {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(requestData.value)
+    })
+    const data = await res.json()
+    if (res.ok) {
+      successMsg.value = 'Account requested! Please wait for the admin to approve it.'
+      requestData.value = { username: '', password: '' }
+    } else {
+      errorMsg.value = data.message || 'Registration failed'
+    }
+  } catch (err) {
+    errorMsg.value = 'Network error'
+  } finally {
     loading.value = false
-  }, 1000)
+  }
 }
 </script>
 
