@@ -18,9 +18,19 @@ npm install
 npm run build
 cd ..
 
-# 4. Copy config templates to /etc
-sudo cp config_templates/dnsmasq.conf /etc/dnsmasq.conf
-sudo cp config_templates/hostapd.conf /etc/hostapd/hostapd.conf
+# 4. Detect Wi-Fi interface and copy config templates
+WIFI_IFACE=$(ls /sys/class/net | grep -E '^wl|^wlan' | head -n 1)
+if [ -z "$WIFI_IFACE" ]; then
+    echo "Warning: Could not detect Wi-Fi interface. Falling back to wlan0."
+    WIFI_IFACE="wlan0"
+else
+    echo "Detected Wi-Fi interface: $WIFI_IFACE"
+fi
+
+sed "s|interface=wlan0|interface=$WIFI_IFACE|g" config_templates/dnsmasq.conf | sudo tee /etc/dnsmasq.conf > /dev/null
+sed "s|interface=wlan0|interface=$WIFI_IFACE|g" config_templates/hostapd.conf | sudo tee /etc/hostapd/hostapd.conf > /dev/null
+sed -i "s|WIFI_IFACE = \"wlan0\"|WIFI_IFACE = \"$WIFI_IFACE\"|g" backend/network.py
+
 sudo systemctl restart dnsmasq hostapd
 
 # 4.5. Configure Sudoers for iptables/ipset
