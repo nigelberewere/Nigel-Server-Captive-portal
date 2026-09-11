@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, request, redirect
 from extensions import db, socketio, login_manager, bcrypt
 import network
 
@@ -19,6 +19,13 @@ def create_app(config_object=None):
     # Register blueprints/routes here
     from routes import api_bp
     app.register_blueprint(api_bp, url_prefix='/api')
+
+    @app.before_request
+    def captive_portal_redirect():
+        # Force a 302 Redirect for any intercepted traffic to trigger the OS popup.
+        # If the requested host isn't 10.0.0.1:5000, iptables has caught them!
+        if request.host != '10.0.0.1:5000' and not request.path.startswith('/api/'):
+            return redirect('http://10.0.0.1:5000/', code=302)
 
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
