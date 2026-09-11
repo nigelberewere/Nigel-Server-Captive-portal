@@ -9,11 +9,11 @@
       <form @submit.prevent="handleLogin" v-if="mode === 'login'">
         <div class="input-group">
           <label>Username</label>
-          <input type="text" v-model="loginData.username" required placeholder="Enter your username" />
+          <input type="text" v-model="loginData.username" placeholder="Enter your username" />
         </div>
         <div class="input-group">
           <label>Password</label>
-          <input type="password" v-model="loginData.password" required placeholder="Enter your password" />
+          <input type="password" v-model="loginData.password" placeholder="Enter your password" />
         </div>
         <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
         <button type="submit" class="btn w-full mt-4" :disabled="loading">
@@ -33,7 +33,7 @@
       <form @submit.prevent="handleVoucher" v-if="mode === 'voucher'">
         <div class="input-group">
           <label>Voucher Code</label>
-          <input type="text" v-model="voucherCode" required placeholder="Enter 8-digit code" />
+          <input type="text" v-model="voucherCode" placeholder="Enter 8-digit code" />
         </div>
         <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
         <button type="submit" class="btn w-full mt-4" :disabled="loading">
@@ -47,11 +47,11 @@
       <form @submit.prevent="handleRequest" v-if="mode === 'request'">
         <div class="input-group">
           <label>Desired Username</label>
-          <input type="text" v-model="requestData.username" required placeholder="Choose a username" />
+          <input type="text" v-model="requestData.username" placeholder="Choose a username" />
         </div>
         <div class="input-group">
           <label>Password</label>
-          <input type="password" v-model="requestData.password" required placeholder="Choose a password" />
+          <input type="password" v-model="requestData.password" placeholder="Choose a password" />
         </div>
         <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
         <div v-if="successMsg" class="success-msg">{{ successMsg }}</div>
@@ -87,8 +87,12 @@ const urlParams = new URLSearchParams(window.location.search);
 const mac_address = urlParams.get('mac') || '';
 
 async function handleLogin() {
-  loading.value = true
   errorMsg.value = ''
+  if (!loginData.value.username || !loginData.value.password) {
+    errorMsg.value = 'Please enter both username and password.'
+    return
+  }
+  loading.value = true
   try {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
@@ -110,8 +114,12 @@ async function handleLogin() {
 }
 
 async function handleVoucher() {
-  loading.value = true
   errorMsg.value = ''
+  if (!voucherCode.value) {
+    errorMsg.value = 'Please enter a voucher code.'
+    return
+  }
+  loading.value = true
   try {
     const res = await fetch('/api/auth/voucher', {
       method: 'POST',
@@ -132,9 +140,13 @@ async function handleVoucher() {
 }
 
 async function handleRequest() {
-  loading.value = true
   errorMsg.value = ''
   successMsg.value = ''
+  if (!requestData.value.username || !requestData.value.password) {
+    errorMsg.value = 'Please choose a username and password.'
+    return
+  }
+  loading.value = true
   try {
     const res = await fetch('/api/auth/register', {
       method: 'POST',
