@@ -50,5 +50,5 @@ if __name__ == '__main__':
     network.init_ipset()
     network.apply_iptables_rules()
             
-    socketio.run(app, host='0.0.0.0', port=5000)
+    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
 
