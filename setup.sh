@@ -31,6 +31,17 @@ sed "s|interface=wlan0|interface=$WIFI_IFACE|g" config_templates/dnsmasq.conf | 
 sed "s|interface=wlan0|interface=$WIFI_IFACE|g" config_templates/hostapd.conf | sudo tee /etc/hostapd/hostapd.conf > /dev/null
 sed -i "s|WIFI_IFACE = \"wlan0\"|WIFI_IFACE = \"$WIFI_IFACE\"|g" backend/network.py
 
+# Assign the static IP to the interface so dnsmasq can bind to it
+sudo ip addr add 10.0.0.1/24 dev $WIFI_IFACE || true
+sudo ip link set $WIFI_IFACE up
+
+# Make it persistent for dnsmasq across reboots
+sudo mkdir -p /etc/systemd/system/dnsmasq.service.d
+echo "[Service]
+ExecStartPre=-/usr/bin/ip addr add 10.0.0.1/24 dev $WIFI_IFACE
+ExecStartPre=-/usr/bin/ip link set $WIFI_IFACE up" | sudo tee /etc/systemd/system/dnsmasq.service.d/override.conf > /dev/null
+
+sudo systemctl daemon-reload
 sudo systemctl restart dnsmasq hostapd
 
 # 4.5. Configure Sudoers for iptables/ipset

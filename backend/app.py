@@ -1,5 +1,6 @@
 from flask import Flask
 from extensions import db, socketio, login_manager, bcrypt
+import network
 
 def create_app(config_object=None):
     app = Flask(__name__, static_folder='../frontend/dist', static_url_path='/')
@@ -44,6 +45,10 @@ if __name__ == '__main__':
             ]
             db.session.bulk_save_objects(defaults)
             db.session.commit()
+            
+    # Initialize ipset and apply iptables redirection rules
+    network.init_ipset()
+    network.apply_iptables_rules()
             
     socketio.run(app, host='0.0.0.0', port=5000)
 
