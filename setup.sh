@@ -37,6 +37,7 @@ sudo ip addr flush dev $WIFI_IFACE
 sudo ip addr add 10.0.0.1/24 dev $WIFI_IFACE || true
 
 # 1. Tell NetworkManager to ignore the Wi-Fi interface so it doesn't wipe our IP
+sudo mkdir -p /etc/NetworkManager/conf.d
 echo -e "[keyfile]\nunmanaged-devices=interface-name:$WIFI_IFACE" | sudo tee /etc/NetworkManager/conf.d/99-unmanaged-wlan.conf > /dev/null
 sudo systemctl restart NetworkManager || true
 
