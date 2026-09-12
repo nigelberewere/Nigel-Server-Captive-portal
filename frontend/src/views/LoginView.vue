@@ -6,14 +6,15 @@
         <p class="text-muted mt-2">Sign in to access the network</p>
       </div>
 
+      <!-- Login Form -->
       <form @submit.prevent="handleLogin" v-if="mode === 'login'">
         <div class="input-group">
           <label>Username</label>
-          <input type="text" v-model="loginData.username" placeholder="Enter your username" />
+          <input type="text" v-model.trim="loginData.username" placeholder="Enter your username" @input="clearMessages" required />
         </div>
         <div class="input-group">
           <label>Password</label>
-          <input type="password" v-model="loginData.password" placeholder="Enter your password" />
+          <input type="password" v-model="loginData.password" placeholder="Enter your password" @input="clearMessages" required />
         </div>
         <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
         <button type="submit" class="btn w-full mt-4" :disabled="loading">
@@ -23,43 +24,52 @@
         <div class="mt-6 text-center text-sm text-muted">
           <p>Don't have an account?</p>
           <div class="flex justify-center gap-4 mt-2">
-            <a href="#" @click.prevent="mode = 'voucher'">Use a Voucher</a>
+            <a href="#" @click.prevent="setMode('voucher')">Use a Voucher</a>
             <span class="text-muted">•</span>
-            <a href="#" @click.prevent="mode = 'request'">Request Access</a>
+            <a href="#" @click.prevent="setMode('request')">Request Access</a>
           </div>
         </div>
       </form>
 
+      <!-- Voucher Form -->
       <form @submit.prevent="handleVoucher" v-if="mode === 'voucher'">
         <div class="input-group">
           <label>Voucher Code</label>
-          <input type="text" v-model="voucherCode" placeholder="Enter 8-digit code" />
+          <input 
+            type="text" 
+            v-model.trim="voucherCode" 
+            placeholder="Enter 8-digit code (e.g. FZP9RYCJ)" 
+            @input="voucherCode = voucherCode.toUpperCase(); clearMessages()" 
+            style="text-transform: uppercase; font-weight: bold; letter-spacing: 0.1em;"
+            required 
+          />
         </div>
         <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
         <button type="submit" class="btn w-full mt-4" :disabled="loading">
           {{ loading ? 'Verifying...' : 'Apply Voucher' }}
         </button>
         <div class="mt-4 text-center text-sm">
-          <a href="#" @click.prevent="mode = 'login'">Back to Login</a>
+          <a href="#" @click.prevent="setMode('login')">Back to Login</a>
         </div>
       </form>
       
+      <!-- Request Access Form -->
       <form @submit.prevent="handleRequest" v-if="mode === 'request'">
         <div class="input-group">
           <label>Desired Username</label>
-          <input type="text" v-model="requestData.username" placeholder="Choose a username" />
+          <input type="text" v-model.trim="requestData.username" placeholder="Choose a username" @input="clearMessages" required />
         </div>
         <div class="input-group">
           <label>Password</label>
-          <input type="password" v-model="requestData.password" placeholder="Choose a password" />
+          <input type="password" v-model="requestData.password" placeholder="Choose a password" @input="clearMessages" required />
         </div>
         <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
         <div v-if="successMsg" class="success-msg">{{ successMsg }}</div>
-        <button type="submit" class="btn w-full mt-4" :disabled="loading || successMsg">
+        <button type="submit" class="btn w-full mt-4" :disabled="loading">
           {{ loading ? 'Sending...' : 'Request Account' }}
         </button>
         <div class="mt-4 text-center text-sm">
-          <a href="#" @click.prevent="mode = 'login'">Back to Login</a>
+          <a href="#" @click.prevent="setMode('login')">Back to Login</a>
         </div>
       </form>
 
@@ -68,7 +78,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 
 const router = useRouter()
@@ -81,13 +91,37 @@ const loginData = ref({ username: '', password: '' })
 const voucherCode = ref('')
 const requestData = ref({ username: '', password: '' })
 
-// In a real captive portal scenario, the OS usually appends a MAC or IP in the redirect URL
-// For this demo, we'll try to extract it from query params or let backend handle it by IP
 const urlParams = new URLSearchParams(window.location.search);
 const mac_address = urlParams.get('mac') || '';
 
-async function handleLogin() {
+function setMode(newMode) {
+  mode.value = newMode
+  clearMessages()
+}
+
+function clearMessages() {
   errorMsg.value = ''
+  successMsg.value = ''
+}
+
+// Check if this device is already authenticated
+onMounted(async () => {
+  try {
+    const res = await fetch('/api/auth/status')
+    if (res.ok) {
+      const data = await res.json()
+      if (data.authenticated) {
+        if (data.role === 'admin') router.push('/admin')
+        else router.push('/hub')
+      }
+    }
+  } catch (err) {
+    // offline or backend restarting
+  }
+})
+
+async function handleLogin() {
+  clearMessages()
   if (!loginData.value.username || !loginData.value.password) {
     errorMsg.value = 'Please enter both username and password.'
     return
@@ -114,8 +148,9 @@ async function handleLogin() {
 }
 
 async function handleVoucher() {
-  errorMsg.value = ''
-  if (!voucherCode.value) {
+  clearMessages()
+  const code = voucherCode.value.trim().toUpperCase()
+  if (!code) {
     errorMsg.value = 'Please enter a voucher code.'
     return
   }
@@ -124,7 +159,7 @@ async function handleVoucher() {
     const res = await fetch('/api/auth/voucher', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code: voucherCode.value, mac_address })
+      body: JSON.stringify({ code, mac_address })
     })
     const data = await res.json()
     if (res.ok) {
@@ -133,15 +168,14 @@ async function handleVoucher() {
       errorMsg.value = data.message || 'Invalid voucher'
     }
   } catch (err) {
-    errorMsg.value = 'Network error'
+    errorMsg.value = 'Network error. Could not reach server.'
   } finally {
     loading.value = false
   }
 }
 
 async function handleRequest() {
-  errorMsg.value = ''
-  successMsg.value = ''
+  clearMessages()
   if (!requestData.value.username || !requestData.value.password) {
     errorMsg.value = 'Please choose a username and password.'
     return
@@ -155,13 +189,13 @@ async function handleRequest() {
     })
     const data = await res.json()
     if (res.ok) {
-      successMsg.value = 'Account requested! Please wait for the admin to approve it.'
+      successMsg.value = data.message || 'Account requested! Please wait for the admin to approve it.'
       requestData.value = { username: '', password: '' }
     } else {
       errorMsg.value = data.message || 'Registration failed'
     }
   } catch (err) {
-    errorMsg.value = 'Network error'
+    errorMsg.value = 'Network error. Could not reach server.'
   } finally {
     loading.value = false
   }

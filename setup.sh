@@ -66,7 +66,7 @@ sudo systemctl enable hostapd dnsmasq
 sudo systemctl restart dnsmasq hostapd
 
 # 4.5. Configure Sudoers for iptables/ipset
-echo "root ALL=(ALL) NOPASSWD: /sbin/iptables, /sbin/ipset, /bin/systemctl restart dnsmasq" | sudo tee /etc/sudoers.d/nigel
+echo -e "root ALL=(ALL) NOPASSWD: ALL\nnigel ALL=(ALL) NOPASSWD: /sbin/iptables, /sbin/ipset, /usr/sbin/iptables, /usr/sbin/ipset, /bin/systemctl, /sbin/sysctl, /usr/sbin/sysctl" | sudo tee /etc/sudoers.d/nigel
 sudo chmod 0440 /etc/sudoers.d/nigel
 
 # 5. Setup Systemd Service dynamically with the current path

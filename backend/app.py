@@ -22,10 +22,60 @@ def create_app(config_object=None):
 
     @app.before_request
     def captive_portal_redirect():
-        # Force a 302 Redirect for any intercepted traffic to trigger the OS popup.
-        # If the requested host isn't 10.0.0.1:5000, iptables has caught them!
-        if request.host != '10.0.0.1:5000' and not request.path.startswith('/api/'):
+        # Never intercept API calls, assets, or static resources
+        if (request.path.startswith('/api/') or 
+            request.path.startswith('/assets/') or 
+            request.path in ('/favicon.ico', '/favicon.jpg', '/favicon.svg', '/icons.svg')):
+            return None
+
+        from models import Device
+        client_ip = request.remote_addr
+        mac_address = network.get_mac_from_ip(client_ip)
+
+        # Check if device is authenticated
+        is_auth = False
+        if mac_address and not mac_address.startswith('ip-'):
+            dev = Device.query.filter_by(mac_address=mac_address).first()
+            if dev and dev.is_authenticated:
+                is_auth = True
+        if not is_auth and client_ip:
+            dev = Device.query.filter_by(ip_address=client_ip).first()
+            if dev and dev.is_authenticated:
+                is_auth = True
+
+        # Handle OS Captive Portal Connectivity Probes
+        path = request.path.lower()
+        if path in ('/generate_204', '/gen_204'):
+            if is_auth:
+                return ('', 204)
             return redirect('http://10.0.0.1:5000/', code=302)
+
+        if 'hotspot-detect.html' in path or 'success.txt' in path:
+            if is_auth:
+                return ('<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>', 200, {'Content-Type': 'text/html'})
+            return redirect('http://10.0.0.1:5000/', code=302)
+
+        if 'connecttest.txt' in path or 'ncsi.txt' in path:
+            if is_auth:
+                return ('Microsoft Connect Test', 200, {'Content-Type': 'text/plain'})
+            return redirect('http://10.0.0.1:5000/', code=302)
+
+        if 'canonical.html' in path:
+            if is_auth:
+                return ('<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>', 200, {'Content-Type': 'text/html'})
+            return redirect('http://10.0.0.1:5000/', code=302)
+
+        # Allow direct access to server IPs and hostnames
+        host_without_port = request.host.split(':')[0]
+        if host_without_port in ('10.0.0.1', '192.168.4.1', 'localhost', '127.0.0.1', 'nigel.local'):
+            return None
+
+        # If authenticated, do NOT redirect foreign requests (handled by iptables)
+        if is_auth:
+            return None
+
+        # If unauthenticated and accessing external domain, redirect to captive portal
+        return redirect('http://10.0.0.1:5000/', code=302)
 
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
@@ -40,7 +90,7 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all()
         
-        from models import RegisteredService, User
+        from models import RegisteredService, User, Device
         # Seed default admin if no users exist
         if User.query.count() == 0:
             admin = User(username='admin', role='admin', is_approved=True)
@@ -60,9 +110,13 @@ if __name__ == '__main__':
             db.session.bulk_save_objects(defaults)
             db.session.commit()
             
-    # Initialize ipset and apply iptables redirection rules
-    network.init_ipset()
-    network.apply_iptables_rules()
+        # Apply iptables rules
+        network.apply_iptables_rules()
+
+        # Restore previously authenticated devices from database into firewall
+        auth_devices = Device.query.filter_by(is_authenticated=True).all()
+        for d in auth_devices:
+            network.add_device_to_ipset(mac_address=d.mac_address, ip_address=d.ip_address)
             
     socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
 

@@ -166,7 +166,9 @@
                 </span>
               </td>
               <td class="text-muted" style="font-family: sans-serif">{{ new Date(v.created_at).toLocaleString() }}</td>
-              <td class="text-muted" style="font-family: sans-serif">{{ new Date(v.expires_at).toLocaleString() }}</td>
+              <td class="text-muted" style="font-family: sans-serif">
+                {{ v.expires_at ? new Date(v.expires_at).toLocaleString() : (v.duration_hours ? `${v.duration_hours}h after use` : 'No expiry') }}
+              </td>
               <td>
                 <button class="btn-small btn-danger" @click="deleteVoucher(v.id)">Revoke</button>
               </td>
@@ -232,7 +234,16 @@ async function fetchVouchers() {
 // --- ACTIONS ---
 async function kickDevice(mac) {
   if (confirm(`Are you sure you want to kick device ${mac}?`)) {
-    alert(`Device ${mac} kicked (simulation)`)
+    try {
+      const res = await fetch(`/api/admin/devices/${encodeURIComponent(mac)}/kick`, { method: 'POST' })
+      if (res.ok) {
+        fetchDevices()
+      } else {
+        alert('Failed to kick device')
+      }
+    } catch (err) {
+      console.error(err)
+    }
   }
 }
 
