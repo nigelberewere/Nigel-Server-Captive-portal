@@ -40,8 +40,15 @@ if __name__ == '__main__':
     with app.app_context():
         db.create_all()
         
+        from models import RegisteredService, User
+        # Seed default admin if no users exist
+        if User.query.count() == 0:
+            admin = User(username='admin', role='admin', is_approved=True)
+            admin.set_password('admin')
+            db.session.add(admin)
+            db.session.commit()
+
         # Seed default services if none exist
-        from models import RegisteredService
         if RegisteredService.query.count() == 0:
             defaults = [
                 RegisteredService(name="Samba Share", description="Local file server", url="smb://10.0.0.1/share", icon="folder", check_port=445),
