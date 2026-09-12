@@ -36,22 +36,26 @@ sudo ip link set $WIFI_IFACE up
 sudo ip addr flush dev $WIFI_IFACE
 sudo ip addr add 10.0.0.1/24 dev $WIFI_IFACE || true
 
-# 1. Tell NetworkManager to ignore the Wi-Fi interface so it doesn't wipe our IP
-sudo mkdir -p /etc/NetworkManager/conf.d
-echo -e "[keyfile]\nunmanaged-devices=interface-name:$WIFI_IFACE" | sudo tee /etc/NetworkManager/conf.d/99-unmanaged-wlan.conf > /dev/null
-sudo systemctl restart NetworkManager || true
+# 1. Tell NetworkManager to ignore the Wi-Fi interface if NM exists
+if [ -d /etc/NetworkManager/conf.d ]; then
+    echo -e "[keyfile]\nunmanaged-devices=interface-name:$WIFI_IFACE" | sudo tee /etc/NetworkManager/conf.d/99-unmanaged-wlan.conf > /dev/null
+    sudo systemctl restart NetworkManager 2>/dev/null || true
+fi
 
-# 2. Add an automatic network-restore service for boot-ups
+# Stop any wpa_supplicant client that might hold the interface
+sudo systemctl stop wpa_supplicant 2>/dev/null || true
+
+# 2. Add automatic network restore service that runs AFTER hostapd
 sudo tee /etc/systemd/system/restore-wifi-ip.service > /dev/null << EOF
 [Unit]
 Description=Set Static IP for Captive Portal
-Before=dnsmasq.service hostapd.service
-After=network.target
+After=hostapd.service
+Before=dnsmasq.service
+BindsTo=hostapd.service
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sleep 3
-ExecStart=/usr/bin/ip link set $WIFI_IFACE up
+ExecStart=/usr/bin/ip link set dev $WIFI_IFACE up
 ExecStart=/usr/bin/ip addr flush dev $WIFI_IFACE
 ExecStart=/usr/bin/ip addr add 10.0.0.1/24 dev $WIFI_IFACE
 
@@ -61,9 +65,17 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable restore-wifi-ip.service
-sudo systemctl start restore-wifi-ip.service
+
+# 3. Start hostapd FIRST, assign IP, then start dnsmasq
+sudo systemctl unmask hostapd 2>/dev/null || true
 sudo systemctl enable hostapd dnsmasq
-sudo systemctl restart dnsmasq hostapd
+sudo systemctl restart hostapd
+sleep 1
+
+sudo ip link set dev $WIFI_IFACE up
+sudo ip addr flush dev $WIFI_IFACE
+sudo ip addr add 10.0.0.1/24 dev $WIFI_IFACE
+sudo systemctl restart dnsmasq
 
 # 4.5. Configure Sudoers for iptables/ipset
 echo -e "root ALL=(ALL) NOPASSWD: ALL\nnigel ALL=(ALL) NOPASSWD: /sbin/iptables, /sbin/ipset, /usr/sbin/iptables, /usr/sbin/ipset, /bin/systemctl, /sbin/sysctl, /usr/sbin/sysctl" | sudo tee /etc/sudoers.d/nigel
