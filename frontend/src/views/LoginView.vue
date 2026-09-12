@@ -38,7 +38,7 @@
           <input 
             type="text" 
             v-model.trim="voucherCode" 
-            placeholder="Enter 8-digit code (e.g. FZP9RYCJ)" 
+            placeholder="Enter 8-digit code" 
             @input="voucherCode = voucherCode.toUpperCase(); clearMessages()" 
             style="text-transform: uppercase; font-weight: bold; letter-spacing: 0.1em;"
             required 

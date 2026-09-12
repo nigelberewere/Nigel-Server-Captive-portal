@@ -45,24 +45,35 @@ def create_app(config_object=None):
 
         # Handle OS Captive Portal Connectivity Probes
         path = request.path.lower()
-        if path in ('/generate_204', '/gen_204'):
+        host = (request.host or '').lower()
+
+        # 1. Android probe
+        if path in ('/generate_204', '/gen_204') or 'connectivitycheck.gstatic.com' in host:
             if is_auth:
                 return ('', 204)
             return redirect('http://10.0.0.1:5000/', code=302)
 
-        if 'hotspot-detect.html' in path or 'success.txt' in path:
+        # 2. Apple iOS / macOS CNA probe (turns the "X" into "Done" / Blue Checkmark)
+        if ('hotspot-detect.html' in path or 
+            'success.html' in path or 
+            'success.txt' in path or 
+            'canonical.html' in path or 
+            'captive.apple.com' in host or 
+            'appleiphonecell.com' in host or 
+            'airport.us' in host):
             if is_auth:
                 return ('<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>', 200, {'Content-Type': 'text/html'})
             return redirect('http://10.0.0.1:5000/', code=302)
 
-        if 'connecttest.txt' in path or 'ncsi.txt' in path:
+        # 3. Windows NCSI probe (clears "Action Needed" on Windows)
+        if 'connecttest.txt' in path or 'msftconnecttest.com' in host:
             if is_auth:
                 return ('Microsoft Connect Test', 200, {'Content-Type': 'text/plain'})
             return redirect('http://10.0.0.1:5000/', code=302)
 
-        if 'canonical.html' in path:
+        if 'ncsi.txt' in path or 'msftncsi.com' in host:
             if is_auth:
-                return ('<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>', 200, {'Content-Type': 'text/html'})
+                return ('Microsoft NCSI', 200, {'Content-Type': 'text/plain'})
             return redirect('http://10.0.0.1:5000/', code=302)
 
         # Allow direct access to server IPs and hostnames

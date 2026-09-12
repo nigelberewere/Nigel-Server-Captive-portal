@@ -105,14 +105,17 @@ def apply_iptables_rules():
     run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p udp --dport 53 -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 1 -i {WIFI_IFACE} -p udp --dport 53 -j ACCEPT")
     run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp --dport 53 -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 2 -i {WIFI_IFACE} -p tcp --dport 53 -j ACCEPT")
 
-    # 2. Allow traffic from authenticated MACs & IPs (Bypass captive portal redirect)
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 3 -i {WIFI_IFACE} -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT")
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -m set --match-set {IPSET_IP_NAME} src -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 4 -i {WIFI_IFACE} -m set --match-set {IPSET_IP_NAME} src -j ACCEPT")
+    # 2. Port 5000 direct access
+    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp --dport 5000 -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 3 -i {WIFI_IFACE} -p tcp --dport 5000 -j ACCEPT")
 
-    # 3. Direct traffic to local portal ports (5000) is accepted
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp --dport 5000 -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 5 -i {WIFI_IFACE} -p tcp --dport 5000 -j ACCEPT")
+    # 3. Always redirect local port 80 traffic (destined for 10.0.0.1) to port 5000 so OS probes reach Flask
+    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp -d 10.0.0.1 --dport 80 -j REDIRECT --to-port 5000 2>/dev/null || sudo iptables -t nat -I PREROUTING 4 -i {WIFI_IFACE} -p tcp -d 10.0.0.1 --dport 80 -j REDIRECT --to-port 5000")
 
-    # 4. Redirect unauthenticated HTTP (Port 80) to captive portal
+    # 4. For authenticated MACs & IPs: allow all external traffic
+    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 5 -i {WIFI_IFACE} -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT")
+    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -m set --match-set {IPSET_IP_NAME} src -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 6 -i {WIFI_IFACE} -m set --match-set {IPSET_IP_NAME} src -j ACCEPT")
+
+    # 5. Redirect unauthenticated external HTTP (Port 80) to captive portal
     run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp --dport 80 -j REDIRECT --to-port 5000 2>/dev/null || sudo iptables -t nat -A PREROUTING -i {WIFI_IFACE} -p tcp --dport 80 -j REDIRECT --to-port 5000")
 
     # 5. FORWARD rules: Allow authenticated devices to forward packets through router to WAN

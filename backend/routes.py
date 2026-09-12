@@ -333,11 +333,26 @@ def delete_user(user_id):
     if current_user.role != 'admin':
         return jsonify({'message': 'Unauthorized'}), 403
     u = User.query.get(user_id)
-    if u:
-        db.session.delete(u)
-        db.session.commit()
-        return jsonify({'message': 'Deleted'}), 200
-    return jsonify({'message': 'Not found'}), 404
+    if not u:
+        return jsonify({'message': 'User not found'}), 404
+    if u.id == current_user.id:
+        return jsonify({'message': 'Cannot delete your own admin account'}), 400
+        
+    # Unlink or kick associated devices
+    try:
+        from models import AuditLog
+        user_devices = Device.query.filter_by(user_id=u.id).all()
+        for dev in user_devices:
+            dev.user_id = None
+            dev.is_authenticated = False
+            network.remove_device_from_ipset(mac_address=dev.mac_address, ip_address=dev.ip_address)
+        AuditLog.query.filter_by(user_id=u.id).delete()
+    except Exception:
+        pass
+        
+    db.session.delete(u)
+    db.session.commit()
+    return jsonify({'message': 'User deleted'}), 200
 
 # Voucher Management Endpoints
 import random

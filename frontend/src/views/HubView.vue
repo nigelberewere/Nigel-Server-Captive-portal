@@ -37,6 +37,13 @@ const router = useRouter()
 const services = ref([])
 
 onMounted(async () => {
+  // Ping captive probe endpoints so iOS and Windows background checkers immediately see 200 Success
+  try {
+    fetch('/hotspot-detect.html', { cache: 'no-store' }).catch(() => {})
+    fetch('/generate_204', { cache: 'no-store' }).catch(() => {})
+    fetch('/connecttest.txt', { cache: 'no-store' }).catch(() => {})
+  } catch (e) {}
+
   try {
     const res = await fetch('/api/hub/services')
     if (res.ok) {

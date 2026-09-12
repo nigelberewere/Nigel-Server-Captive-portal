@@ -97,7 +97,7 @@
               </td>
               <td>
                 <div class="flex gap-2">
-                  <button v-if="!user.is_approved" class="btn-small" style="background: var(--primary-color)" @click="approveUser(user.id)">Approve</button>
+                  <button v-if="!user.is_approved" class="btn-small btn-approve" @click="approveUser(user.id)">Approve</button>
                   <button v-if="user.role !== 'admin'" class="btn-small btn-danger" @click="deleteUser(user.id)">Delete</button>
                 </div>
               </td>
@@ -237,19 +237,24 @@ async function kickDevice(mac) {
     try {
       const res = await fetch(`/api/admin/devices/${encodeURIComponent(mac)}/kick`, { method: 'POST' })
       if (res.ok) {
-        fetchDevices()
+        await fetchDevices()
       } else {
-        alert('Failed to kick device')
+        const data = await res.json().catch(() => ({}))
+        alert(data.message || 'Failed to kick device')
       }
     } catch (err) {
-      console.error(err)
+      alert('Network error when kicking device')
     }
   }
 }
 
 async function approveUser(id) {
-  await fetch(`/api/admin/users/${id}/approve`, { method: 'POST' })
-  fetchUsers()
+  const res = await fetch(`/api/admin/users/${id}/approve`, { method: 'POST' })
+  if (res.ok) {
+    await fetchUsers()
+  } else {
+    alert('Failed to approve user')
+  }
 }
 
 async function createUser() {
@@ -260,31 +265,54 @@ async function createUser() {
   if (res.ok) {
     newUser.value = { username: '', password: '', role: 'user' }
     showAddUser.value = false
-    fetchUsers()
+    await fetchUsers()
   } else {
-    alert('Failed to create user (username might exist)')
+    const data = await res.json().catch(() => ({}))
+    alert(data.message || 'Failed to create user')
   }
 }
 
 async function deleteUser(id) {
-  if (confirm('Delete this user?')) {
-    await fetch(`/api/admin/users/${id}`, { method: 'DELETE' })
-    fetchUsers()
+  if (confirm('Are you sure you want to delete this user?')) {
+    try {
+      const res = await fetch(`/api/admin/users/${id}`, { method: 'DELETE' })
+      if (res.ok) {
+        await fetchUsers()
+      } else {
+        const data = await res.json().catch(() => ({}))
+        alert(data.message || 'Failed to delete user')
+      }
+    } catch (err) {
+      alert('Network error when deleting user')
+    }
   }
 }
 
 async function generateVouchers() {
-  await fetch('/api/admin/vouchers', {
+  const res = await fetch('/api/admin/vouchers', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ count: voucherCount.value, duration_hours: voucherDuration.value })
   })
-  fetchVouchers()
+  if (res.ok) {
+    await fetchVouchers()
+  } else {
+    alert('Failed to generate vouchers')
+  }
 }
 
 async function deleteVoucher(id) {
-  if (confirm('Revoke this voucher?')) {
-    await fetch(`/api/admin/vouchers/${id}`, { method: 'DELETE' })
-    fetchVouchers()
+  if (confirm('Are you sure you want to revoke this voucher?')) {
+    try {
+      const res = await fetch(`/api/admin/vouchers/${id}`, { method: 'DELETE' })
+      if (res.ok) {
+        await fetchVouchers()
+      } else {
+        const data = await res.json().catch(() => ({}))
+        alert(data.message || 'Failed to revoke voucher')
+      }
+    } catch (err) {
+      alert('Network error when revoking voucher')
+    }
   }
 }
 
@@ -328,8 +356,8 @@ onUnmounted(() => {
   background: var(--surface-light);
 }
 .tabs button.active {
-  color: var(--primary-color);
-  background: rgba(99, 102, 241, 0.1);
+  color: var(--accent-color);
+  background: rgba(245, 158, 11, 0.15);
 }
 
 .table-responsive { overflow-x: auto; }
@@ -339,8 +367,20 @@ th { color: var(--text-muted); font-weight: 500; font-size: 0.875rem; text-trans
 .text-2xl { font-size: 2rem; font-weight: 600; font-family: var(--font-display); }
 .flex-1 { flex: 1; }
 .py-4 { padding-top: 1rem; padding-bottom: 1rem; }
-.btn-small { padding: 0.25rem 0.75rem; font-size: 0.875rem; border-radius: 4px; }
+.btn-small { padding: 0.35rem 0.85rem; font-size: 0.875rem; border-radius: 6px; }
+.btn-approve {
+  background-color: #10b981;
+  color: #000000;
+  border: none;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.2s;
+}
+.btn-approve:hover {
+  background-color: #059669;
+}
 .status-badge { display: inline-block; padding: 0.25rem 0.5rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
-.status-badge.auth { background-color: rgba(16, 185, 129, 0.1); color: #10b981; }
-.status-badge.unauth { background-color: rgba(161, 161, 170, 0.1); color: #a1a1aa; }
+.status-badge.auth { background-color: rgba(16, 185, 129, 0.15); color: #10b981; }
+.status-badge.unauth { background-color: rgba(161, 161, 170, 0.15); color: #a1a1aa; }
+.status-badge.used { background-color: rgba(245, 158, 11, 0.15); color: #f59e0b; }
 </style>
