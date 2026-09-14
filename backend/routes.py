@@ -1,11 +1,29 @@
 from flask import Blueprint, request, jsonify
 from flask_login import login_user, logout_user, login_required, current_user
 from models import User, Device, Voucher, Setting, RegisteredService
-from extensions import db
+from extensions import db, socketio
 import network
 import datetime
 
 api_bp = Blueprint('api', __name__)
+
+def notify_users_changed():
+    try:
+        socketio.emit('users_update')
+    except Exception:
+        pass
+
+def notify_devices_changed():
+    try:
+        socketio.emit('devices_update')
+    except Exception:
+        pass
+
+def notify_vouchers_changed():
+    try:
+        socketio.emit('vouchers_update')
+    except Exception:
+        pass
 
 @api_bp.route('/auth/status', methods=['GET'])
 def auth_status():
@@ -48,6 +66,8 @@ def register():
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip()
     password = data.get('password')
+    client_ip = request.remote_addr
+    mac_address = data.get('mac_address') or network.get_mac_from_ip(client_ip) or f"ip-{client_ip}"
     
     if not username or not password:
         return jsonify({'message': 'Please provide both username and password'}), 400
@@ -59,7 +79,24 @@ def register():
     new_user = User(username=username, role='user', is_approved=False)
     new_user.set_password(password)
     db.session.add(new_user)
+    db.session.flush()
+
+    # Link device to pending user
+    device = None
+    if mac_address and not mac_address.startswith('ip-'):
+        device = Device.query.filter_by(mac_address=mac_address).first()
+    if not device and client_ip:
+        device = Device.query.filter_by(ip_address=client_ip).first()
+        
+    if not device:
+        device = Device(mac_address=mac_address, ip_address=client_ip, user_id=new_user.id, is_authenticated=False)
+        db.session.add(device)
+    else:
+        device.user_id = new_user.id
+        device.is_authenticated = False
+
     db.session.commit()
+    notify_users_changed()
     return jsonify({'message': 'Account requested! Waiting for admin approval.'}), 201
 
 @api_bp.route('/auth/login', methods=['POST'])
@@ -100,6 +137,7 @@ def login():
         
         # Whitelist device in firewall (both MAC and IP)
         network.add_device_to_ipset(mac_address=mac_address, ip_address=client_ip)
+        notify_devices_changed()
             
         return jsonify({'message': 'Logged in successfully', 'role': user.role, 'mac_address': mac_address}), 200
         
@@ -117,6 +155,7 @@ def logout():
             device.is_authenticated = False
             db.session.commit()
             network.remove_device_from_ipset(mac_address=mac_address, ip_address=device.ip_address)
+            notify_devices_changed()
             
     if current_user.is_authenticated:
         logout_user()
@@ -172,6 +211,8 @@ def use_voucher():
     
     # Instantly allow device traffic through firewall
     network.add_device_to_ipset(mac_address=mac_address, ip_address=client_ip)
+    notify_devices_changed()
+    notify_vouchers_changed()
     
     return jsonify({
         'message': 'Voucher applied! Network access granted.',
@@ -323,8 +364,27 @@ def approve_user(user_id):
     u = User.query.get(user_id)
     if u:
         u.is_approved = True
+        now = datetime.datetime.utcnow()
+        
+        # Instantly authenticate all devices linked to this user
+        user_devices = Device.query.filter_by(user_id=u.id).all()
+        for dev in user_devices:
+            dev.is_authenticated = True
+            dev.connected_at = now
+            dev.last_seen = now
+            network.add_device_to_ipset(mac_address=dev.mac_address, ip_address=dev.ip_address)
+            
         db.session.commit()
-        return jsonify({'message': 'Approved'}), 200
+        notify_users_changed()
+        notify_devices_changed()
+        
+        # Broadcast approval so user's waiting screen transitions immediately
+        try:
+            socketio.emit('user_approved', {'user_id': u.id, 'username': u.username})
+        except Exception:
+            pass
+            
+        return jsonify({'message': 'Approved! Device access granted.'}), 200
     return jsonify({'message': 'Not found'}), 404
 
 @api_bp.route('/admin/users/<int:user_id>', methods=['DELETE'])
@@ -367,6 +427,22 @@ def admin_vouchers():
     if current_user.role != 'admin':
         return jsonify({'message': 'Unauthorized'}), 403
         
+    now = datetime.datetime.utcnow()
+    # Automatically erase expired vouchers from database and UI
+    expired = Voucher.query.filter(Voucher.expires_at != None, Voucher.expires_at <= now).all()
+    if expired:
+        for ev in expired:
+            if ev.used_by_device:
+                dev = Device.query.filter_by(mac_address=ev.used_by_device).first()
+                if dev:
+                    dev.is_authenticated = False
+                    network.remove_device_from_ipset(mac_address=ev.used_by_device, ip_address=dev.ip_address)
+                else:
+                    network.remove_device_from_ipset(mac_address=ev.used_by_device)
+            db.session.delete(ev)
+        db.session.commit()
+        notify_devices_changed()
+
     if request.method == 'GET':
         vouchers = Voucher.query.order_by(Voucher.created_at.desc()).all()
         return jsonify([{

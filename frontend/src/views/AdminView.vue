@@ -321,16 +321,32 @@ async function logout() {
   router.push('/login')
 }
 
+let pollTimer = null
+
 onMounted(() => {
   fetchDevices()
   fetchUsers()
   fetchVouchers()
   
-  socket = io()
-  socket.on('devices_update', (data) => devices.value = data)
+  try {
+    socket = io()
+    socket.on('devices_update', () => fetchDevices())
+    socket.on('users_update', () => fetchUsers())
+    socket.on('vouchers_update', () => fetchVouchers())
+  } catch (e) {
+    console.error('Socket error:', e)
+  }
+
+  // Automatic background refresh every 3 seconds for instant updates without page reload
+  pollTimer = setInterval(() => {
+    fetchUsers()
+    fetchDevices()
+    fetchVouchers()
+  }, 3000)
 })
 
 onUnmounted(() => {
+  if (pollTimer) clearInterval(pollTimer)
   if (socket) socket.disconnect()
 })
 </script>

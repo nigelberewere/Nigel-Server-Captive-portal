@@ -64,7 +64,12 @@
           <input type="password" v-model="requestData.password" placeholder="Choose a password" @input="clearMessages" required />
         </div>
         <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
-        <div v-if="successMsg" class="success-msg">{{ successMsg }}</div>
+        <div v-if="successMsg" class="success-msg">
+          {{ successMsg }}
+          <div class="mt-2 text-xs text-muted" style="display: flex; align-items: center; justify-content: center; gap: 0.5rem;">
+            <span>Waiting for admin approval...</span>
+          </div>
+        </div>
         <button type="submit" class="btn w-full mt-4" :disabled="loading">
           {{ loading ? 'Sending...' : 'Request Account' }}
         </button>
@@ -73,19 +78,26 @@
         </div>
       </form>
 
+      <div class="mt-8 pt-4 text-center text-xs text-muted" style="border-top: 1px solid var(--border-color);">
+        <router-link to="/admin" style="color: var(--text-muted);">Admin Portal &rarr;</router-link>
+      </div>
+
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { io } from 'socket.io-client'
 
 const router = useRouter()
 const mode = ref('login') // login, voucher, request
 const loading = ref(false)
 const errorMsg = ref('')
 const successMsg = ref('')
+let socket = null
+let approvalWatcherTimer = null
 
 const loginData = ref({ username: '', password: '' })
 const voucherCode = ref('')
@@ -97,6 +109,7 @@ const mac_address = urlParams.get('mac') || '';
 function setMode(newMode) {
   mode.value = newMode
   clearMessages()
+  if (approvalWatcherTimer) clearInterval(approvalWatcherTimer)
 }
 
 function clearMessages() {
@@ -104,20 +117,37 @@ function clearMessages() {
   successMsg.value = ''
 }
 
-// Check if this device is already authenticated
-onMounted(async () => {
+async function checkAuthStatus() {
   try {
     const res = await fetch('/api/auth/status')
     if (res.ok) {
       const data = await res.json()
       if (data.authenticated) {
+        if (approvalWatcherTimer) clearInterval(approvalWatcherTimer)
         if (data.role === 'admin') router.push('/admin')
         else router.push('/hub')
       }
     }
-  } catch (err) {
-    // offline or backend restarting
-  }
+  } catch (err) {}
+}
+
+function startApprovalWatcher() {
+  if (approvalWatcherTimer) clearInterval(approvalWatcherTimer)
+  // Poll every 2 seconds until approved
+  approvalWatcherTimer = setInterval(checkAuthStatus, 2000)
+}
+
+onMounted(() => {
+  checkAuthStatus()
+  try {
+    socket = io()
+    socket.on('user_approved', () => checkAuthStatus())
+  } catch (e) {}
+})
+
+onUnmounted(() => {
+  if (approvalWatcherTimer) clearInterval(approvalWatcherTimer)
+  if (socket) socket.disconnect()
 })
 
 async function handleLogin() {
@@ -185,12 +215,14 @@ async function handleRequest() {
     const res = await fetch('/api/auth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestData.value)
+      body: JSON.stringify({ ...requestData.value, mac_address })
     })
     const data = await res.json()
     if (res.ok) {
-      successMsg.value = data.message || 'Account requested! Please wait for the admin to approve it.'
+      successMsg.value = data.message || 'Account requested! Waiting for admin approval.'
       requestData.value = { username: '', password: '' }
+      // Start auto-checking so as soon as admin clicks Approve, page switches to /hub!
+      startApprovalWatcher()
     } else {
       errorMsg.value = data.message || 'Registration failed'
     }
