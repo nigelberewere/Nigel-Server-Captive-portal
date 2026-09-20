@@ -34,7 +34,7 @@ install_phase() {
   systemctl mask --runtime dnsmasq.service hostapd.service 2>/dev/null || true
   trap 'systemctl unmask dnsmasq.service hostapd.service 2>/dev/null || true' EXIT
   apt-get update
-  apt-get install -y python3 python3-venv python3-pip iptables ipset dnsmasq hostapd iw wpa-supplicant nodejs npm curl gettext-base build-essential
+  apt-get install -y python3 python3-venv python3-pip iptables ipset dnsmasq hostapd iw wpasupplicant nodejs npm curl gettext-base build-essential
   if ! command -v node >/dev/null 2>&1 || (( $(node -p 'process.versions.node.split(".")[0]') < 18 )); then
     if [[ ${ALLOW_NODESOURCE:-0} == 1 ]]; then
       curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
