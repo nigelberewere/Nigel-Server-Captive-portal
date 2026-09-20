@@ -120,7 +120,7 @@ def _restore(table, chain, rules):
 
 
 def _ipset_restore(entries=(), set_name=IPSET_MAC_NAME):
-    lines = [f"create {set_name} hash:mac family inet counters -exist"]
+    lines = [f"create {set_name} hash:mac counters -exist"]
     lines.extend(f"add {set_name} {entry} -exist" for entry in entries)
     run_cmd(["ipset", "restore"], check=True, input_text="\n".join(lines) + "\n")
 
