@@ -13,6 +13,7 @@ IPSET_TRUSTED_NAME = "nigel_trusted_macs"
 WIFI_IFACE = os.environ.get("WIFI_IFACE")
 WIFI_IP = os.environ.get("NIGEL_WIFI_IP")
 WIFI_PREFIX = os.environ.get("NIGEL_WIFI_PREFIX", "24")
+WIFI_SUBNET = os.environ.get("NIGEL_WIFI_SUBNET")
 STRICT_MODE = os.environ.get("NIGEL_STRICT", "1").lower() not in {"0", "false", "no"}
 MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$", re.IGNORECASE)
 IFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
@@ -47,6 +48,14 @@ def _configured_ip():
     if not value:
         raise ValueError("NIGEL_WIFI_IP is not configured or is invalid")
     return value
+
+
+def _hotspot_active():
+    if not WIFI_IFACE or not WIFI_IP:
+        return False
+    mode = run_cmd(["iw", "dev", WIFI_IFACE, "info"])
+    address = run_cmd(["ip", "-4", "-o", "addr", "show", "dev", WIFI_IFACE])
+    return bool(mode and "type AP" in mode and address and f"{WIFI_IP}/{WIFI_PREFIX}" in address)
 
 
 def run_cmd(args, check=False, input_text=None):
@@ -90,6 +99,12 @@ def _chain_exists(table, chain):
     return result.returncode == 0
 
 
+def _chain_has_rules(table, chain):
+    command = ["iptables-save", "-t", table]
+    saved = run_cmd(command) or ''
+    return any(line.startswith(f"-A {chain} ") for line in saved.splitlines())
+
+
 def _ensure_chain(table, chain, parent):
     if not _chain_exists(table, chain):
         _iptables(table, "-N", chain, check=True)
@@ -105,7 +120,7 @@ def _restore(table, chain, rules):
 
 
 def _ipset_restore(entries=(), set_name=IPSET_MAC_NAME):
-    lines = [f"create {set_name} hash:mac family inet -exist"]
+    lines = [f"create {set_name} hash:mac family inet counters -exist"]
     lines.extend(f"add {set_name} {entry} -exist" for entry in entries)
     run_cmd(["ipset", "restore"], check=True, input_text="\n".join(lines) + "\n")
 
@@ -172,14 +187,14 @@ def get_device_telemetry(mac_address):
                                 pass
                             break
     data_used_mb = 0.0
-    rules = run_cmd(["iptables", "-w", "-L", "NIGEL_FWD", "-v", "-n"])
-    if rules:
-        for row in rules.splitlines():
-            if mac in row.lower():
-                fields = row.split()
+    saved = run_cmd(["ipset", "-o", "save", IPSET_MAC_NAME])
+    if saved:
+        for row in saved.splitlines():
+            fields = row.split()
+            if len(fields) >= 4 and fields[0] == "add" and fields[2] == mac:
                 try:
-                    data_used_mb = float(fields[1]) / (1024 * 1024)
-                except (IndexError, ValueError):
+                    data_used_mb = float(fields[fields.index("bytes") + 1]) / (1024 * 1024)
+                except (ValueError, IndexError):
                     pass
                 break
     return {"hostname": hostname, "data_used_mb": data_used_mb, "signal_strength": signal}
@@ -249,8 +264,8 @@ def _configure_chains():
         f"-i {iface} -m set --match-set {IPSET_TRUSTED_NAME} src -j ACCEPT",
         f"-i {iface} -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT",
     ]
-    if STRICT_MODE:
-        input_rules.append(f"-i {iface} -j DROP")
+    if STRICT_MODE and _hotspot_active() and WIFI_SUBNET:
+        input_rules.append(f"-i {iface} -s {WIFI_SUBNET} -j DROP")
     _restore("filter", "NIGEL_INPUT", input_rules)
 
     forward_rules = [
@@ -258,8 +273,8 @@ def _configure_chains():
         f"-i {iface} -m set --match-set {IPSET_TRUSTED_NAME} src -j RETURN",
         f"-i {iface} -m set --match-set {IPSET_MAC_NAME} src -j RETURN",
     ]
-    if STRICT_MODE:
-        forward_rules.append(f"-i {iface} -j DROP")
+    if STRICT_MODE and _hotspot_active() and WIFI_SUBNET:
+        forward_rules.append(f"-i {iface} -s {WIFI_SUBNET} -j DROP")
     _restore("filter", "NIGEL_FWD", forward_rules)
 
     if _chain_exists("filter", "DOCKER-USER"):
@@ -267,8 +282,8 @@ def _configure_chains():
             f"-i {iface} -m set --match-set {IPSET_TRUSTED_NAME} src -j RETURN",
             f"-i {iface} -m set --match-set {IPSET_MAC_NAME} src -j RETURN",
         ]
-        if STRICT_MODE:
-            docker_rules.append(f"-i {iface} -j DROP")
+        if STRICT_MODE and _hotspot_active() and WIFI_SUBNET:
+            docker_rules.append(f"-i {iface} -s {WIFI_SUBNET} -j DROP")
         _restore("filter", "NIGEL_DOCKER_USER", docker_rules)
 
     wan = _default_route_iface()
@@ -299,7 +314,12 @@ def cleanup():
 def _watchdog():
     while True:
         time.sleep(30)
-        if not _chain_exists("filter", "NIGEL_INPUT"):
+        expected = [(table, chain, parent) for table, chain, parent in CHAINS
+                if parent != "DOCKER-USER" or _chain_exists(table, parent)]
+        broken = any(not _chain_exists(table, chain) or not _chain_has_rules(table, chain)
+                 or not _rule_exists(table, parent, "-j", chain)
+                 for table, chain, parent in expected)
+        if broken:
             logger.warning("Nigel firewall was missing; repairing it")
             try:
                 apply_iptables_rules()

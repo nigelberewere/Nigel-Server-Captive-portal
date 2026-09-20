@@ -1,7 +1,7 @@
 <template>
   <div class="container">
     <header class="flex justify-between items-center mb-8">
-      <h1 class="brand-logo">Nigel<span>Server</span></h1>
+      <h1 class="brand-logo">{{ portalName }}</h1>
       <button @click="logout" class="btn btn-secondary">Disconnect</button>
     </header>
 
@@ -29,6 +29,7 @@
     <div class="mt-8 flex gap-4">
       <router-link to="/about" class="btn btn-secondary">About & Rules</router-link>
       <a href="/api/wifi/qr" class="btn btn-secondary" target="_blank" rel="noopener">Wi-Fi QR</a>
+      <a href="/api/portal/qr" class="btn btn-secondary" target="_blank" rel="noopener">Portal QR</a>
     </div>
   </div>
 </template>
@@ -36,11 +37,13 @@
 <script setup>
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { loadPortalConfig, portalName } from '../config'
 
 const router = useRouter()
 const services = ref([])
 
 onMounted(async () => {
+  await loadPortalConfig()
   // Ping captive probe endpoints so iOS and Windows background checkers immediately see 200 Success
   try {
     fetch('/hotspot-detect.html', { cache: 'no-store' }).catch(() => {})

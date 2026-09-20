@@ -1,0 +1,7 @@
+# Verified dependency floor for Python 3.11-3.14.
+# Keep application pins in requirements.txt; this file constrains transitive packages.
+Werkzeug==3.1.8
+SQLAlchemy==2.0.54
+bcrypt==5.0.0
+simple-websocket==1.1.0
+Pillow==12.3.0

@@ -1,0 +1,6 @@
+[
+  {"name": "Samba Share", "description": "Local file server", "url": "smb://10.0.0.1/share", "icon": "folder", "check_port": 445},
+  {"name": "File Browser", "description": "Web file manager", "url": "http://10.0.0.1:80", "icon": "folder", "check_port": 80},
+  {"name": "MiniDLNA", "description": "Media streaming", "url": "http://10.0.0.1:8200", "icon": "film", "check_port": 8200},
+  {"name": "qBittorrent", "description": "Downloads", "url": "http://10.0.0.1:8080", "icon": "download", "check_port": 8080}
+]

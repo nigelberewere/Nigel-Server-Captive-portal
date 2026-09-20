@@ -14,11 +14,19 @@ import re
 import io
 import qrcode
 import hashlib
+from pathlib import Path
+from zoneinfo import ZoneInfo
 from notify import notify_all_async
 
 _rate_limit = {}
 _rate_lock = threading.Lock()
 MAC_RE = re.compile(r'^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$', re.IGNORECASE)
+
+
+def configured_now():
+    timezone_name = os.environ.get('NIGEL_TIMEZONE', 'system')
+    timezone = datetime.datetime.now().astimezone().tzinfo if timezone_name == 'system' else ZoneInfo(timezone_name)
+    return datetime.datetime.now(timezone)
 
 
 def _client_mac():
@@ -48,6 +56,19 @@ def _admin_mac(mac_address):
     return mac_address.lower()
 
 
+def _setting_bool(key, default=True):
+    setting = db.session.get(Setting, key)
+    return default if setting is None else setting.value.lower() in {'1', 'true', 'yes', 'on'}
+
+
+def _setting_int(key, default):
+    setting = db.session.get(Setting, key)
+    try:
+        return int(setting.value) if setting else default
+    except ValueError:
+        return default
+
+
 def _audit(action, details='', user_id=None):
     db.session.add(AuditLog(action=action, details=details, user_id=user_id))
 
@@ -59,6 +80,12 @@ def _notify_device(action, mac_address, username=None):
     notify_all_async(subject)
 
 api_bp = Blueprint('api', __name__)
+
+
+@api_bp.route('/config', methods=['GET'])
+def portal_config():
+    setting = db.session.get(Setting, 'portal_name')
+    return jsonify({'portal_name': setting.value if setting else os.environ.get('PORTAL_NAME', 'Captive Portal')}), 200
 
 def notify_users_changed():
     try:
@@ -118,6 +145,8 @@ def auth_status():
 
 @api_bp.route('/auth/register', methods=['POST'])
 def register():
+    if not _setting_bool('registration_enabled', True):
+        return jsonify({'message': 'Registration is disabled'}), 403
     if _throttled('register', 5):
         return jsonify({'message': 'Too many registration attempts'}), 429
     data = request.get_json(silent=True) or {}
@@ -197,8 +226,8 @@ def login():
         device.user_id = user.id
         device.is_authenticated = True
         device.access_expires_at = None
-        device.connected_at = datetime.datetime.utcnow()
-        device.last_seen = datetime.datetime.utcnow()
+        device.connected_at = configured_now()
+        device.last_seen = configured_now()
         db.session.commit()
         _audit('login', f'mac={mac_address}', user.id)
         db.session.commit()
@@ -239,10 +268,10 @@ def request_password_reset():
     db.session.add(PasswordResetToken(
         user_id=user.id,
         token_hash=hashlib.sha256(raw_token.encode('utf-8')).hexdigest(),
-        expires_at=datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+        expires_at=configured_now() + datetime.timedelta(minutes=15)
     ))
     db.session.commit()
-    logging.getLogger(__name__).warning('Password reset token for %s: %s', username, raw_token)
+    notify_all_async(f'Password reset requested for account {username}')
     return jsonify(response), 200
 
 
@@ -255,11 +284,11 @@ def confirm_password_reset():
         return jsonify({'message': 'Token and a 12-character password are required'}), 400
     token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
     reset = PasswordResetToken.query.filter_by(token_hash=token_hash, used_at=None).first()
-    if not reset or reset.expires_at <= datetime.datetime.utcnow():
+    if not reset or reset.expires_at <= configured_now():
         return jsonify({'message': 'Invalid or expired reset token'}), 400
     reset.user.set_password(password)
     reset.user.must_change_password = False
-    reset.used_at = datetime.datetime.utcnow()
+    reset.used_at = configured_now()
     db.session.commit()
     return jsonify({'message': 'Password reset'}), 200
 
@@ -283,6 +312,8 @@ def logout():
 
 @api_bp.route('/auth/voucher', methods=['POST'])
 def use_voucher():
+    if not _setting_bool('vouchers_enabled', True):
+        return jsonify({'message': 'Vouchers are disabled'}), 403
     if _throttled('voucher', 10):
         return jsonify({'message': 'Too many voucher attempts'}), 429
     data = request.get_json(silent=True) or {}
@@ -297,7 +328,7 @@ def use_voucher():
     if not voucher:
         return jsonify({'message': 'Invalid voucher code'}), 400
         
-    now = datetime.datetime.utcnow()
+    now = configured_now()
     if voucher.expires_at and voucher.expires_at <= now:
         return jsonify({'message': 'This voucher has expired'}), 400
         
@@ -347,6 +378,8 @@ def use_voucher():
 
 @api_bp.route('/auth/guest', methods=['POST'])
 def guest_access():
+    if not _setting_bool('guest_enabled', False):
+        return jsonify({'message': 'Guest access is disabled'}), 403
     if _throttled('guest', 3):
         return jsonify({'message': 'Too many guest requests'}), 429
     mac_address = _client_mac()
@@ -354,10 +387,10 @@ def guest_access():
         return jsonify({'message': 'Could not identify this device'}), 400
     data = request.get_json(silent=True) or {}
     try:
-        duration = max(1, min(24, int(data.get('duration_hours', 2))))
+        duration = max(1, min(_setting_int('guest_max_hours', 24), int(data.get('duration_hours', _setting_int('guest_default_hours', 2)))))
     except (TypeError, ValueError):
         return jsonify({'message': 'Invalid duration'}), 400
-    now = datetime.datetime.utcnow()
+    now = configured_now()
     device = Device.query.filter_by(mac_address=mac_address).first()
     if device and device.is_blocked:
         return jsonify({'message': 'This device is blocked'}), 403
@@ -527,17 +560,34 @@ def audit_logs():
 
 
 @api_bp.route('/wifi/qr', methods=['GET'])
+@login_required
 def wifi_qr():
     ssid = os.environ.get('WIFI_SSID', 'Nigel Server')
-    passphrase = os.environ.get('WIFI_PASSPHRASE', '')
+    passphrase_file = os.environ.get('WIFI_PASSPHRASE_FILE', '/etc/nigel/wifi-passphrase')
+    try:
+        passphrase = Path(passphrase_file).read_text(encoding='utf-8').strip()
+    except OSError:
+        passphrase = ''
     portal_url = os.environ.get('PORTAL_ORIGIN', 'http://localhost:5000')
     security = 'WPA' if passphrase else 'nopass'
-    payload = f'SSID: {ssid}\nSecurity: {security}\nPassword: {passphrase or "(open network)"}\nPortal: {portal_url}'
+    def escape(value):
+        return ''.join('\\' + char if char in '\\;,:' + '"' else char for char in value)
+    payload = f'WIFI:T:{security};S:{escape(ssid)};P:{escape(passphrase)};;'
     image = qrcode.make(payload)
     output = io.BytesIO()
     image.save(output, format='PNG')
     output.seek(0)
     return send_file(output, mimetype='image/png', download_name='nigel-wifi.png')
+
+
+@api_bp.route('/portal/qr', methods=['GET'])
+@login_required
+def portal_qr():
+    image = qrcode.make(os.environ.get('PORTAL_ORIGIN', 'http://localhost:5000'))
+    output = io.BytesIO()
+    image.save(output, format='PNG')
+    output.seek(0)
+    return send_file(output, mimetype='image/png', download_name='nigel-portal.png')
 
 @api_bp.route('/admin/devices/<path:mac_address>/kick', methods=['POST', 'DELETE'])
 @login_required
@@ -632,6 +682,26 @@ def admin_users():
         return jsonify({'message': 'User created'}), 201
 
 
+@api_bp.route('/admin/settings', methods=['GET', 'PUT'])
+@login_required
+def admin_settings():
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    keys = ['portal_name', 'guest_enabled', 'guest_default_hours', 'guest_max_hours', 'registration_enabled', 'vouchers_enabled']
+    if request.method == 'PUT':
+        data = request.get_json(silent=True) or {}
+        for key in keys:
+            if key not in data:
+                continue
+            setting = db.session.get(Setting, key) or Setting(key=key, value='')
+            value = data[key]
+            setting.value = str(value).lower() if isinstance(value, bool) else str(value)
+            db.session.add(setting)
+        _audit('settings_updated', ','.join(sorted(set(data) & set(keys))), current_user.id)
+        db.session.commit()
+    return jsonify({setting.key: setting.value for setting in Setting.query.filter(Setting.key.in_(keys)).all()}), 200
+
+
 @api_bp.route('/admin/users/<int:user_id>/limits', methods=['PUT'])
 @login_required
 def update_user_limits(user_id):
@@ -670,7 +740,7 @@ def approve_user(user_id):
     u = User.query.get(user_id)
     if u:
         u.is_approved = True
-        now = datetime.datetime.utcnow()
+        now = configured_now()
         
         # Instantly authenticate all devices linked to this user
         user_devices = Device.query.filter_by(user_id=u.id).all()
@@ -707,7 +777,7 @@ def admin_reset_password(user_id):
     user.must_change_password = True
     _audit('password_reset', f'user_id={user.id}', current_user.id)
     db.session.commit()
-    logging.getLogger(__name__).warning('Temporary password for %s: %s', user.username, temporary_password)
+    notify_all_async(f'Admin generated a password reset for account {user.username}')
     return jsonify({'message': 'Temporary password generated', 'temporary_password': temporary_password}), 200
 
 @api_bp.route('/admin/users/<int:user_id>', methods=['DELETE'])
@@ -750,7 +820,7 @@ def admin_vouchers():
     if current_user.role != 'admin':
         return jsonify({'message': 'Unauthorized'}), 403
         
-    now = datetime.datetime.utcnow()
+    now = configured_now()
     # Automatically erase expired vouchers from database and UI
     expired = Voucher.query.filter(Voucher.expires_at != None, Voucher.expires_at <= now).all()
     if expired:

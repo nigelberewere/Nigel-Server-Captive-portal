@@ -5,6 +5,7 @@ import secrets
 import threading
 import time
 from datetime import datetime, time as clock_time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from sqlalchemy import inspect, text
 from urllib.parse import urlparse
@@ -13,6 +14,12 @@ from flask import Flask, request, redirect, jsonify
 from flask_login import current_user
 from extensions import db, socketio, login_manager, bcrypt
 import network
+
+
+def configured_now():
+    timezone_name = os.environ.get('NIGEL_TIMEZONE', 'system')
+    timezone = datetime.now().astimezone().tzinfo if timezone_name == 'system' else ZoneInfo(timezone_name)
+    return datetime.now(timezone)
 
 def create_app(config_object=None):
     app = Flask(__name__, static_folder='../frontend/dist', static_url_path='/')
@@ -48,6 +55,10 @@ def create_app(config_object=None):
 
     @app.before_request
     def captive_portal_redirect():
+        if current_user.is_authenticated and getattr(current_user, 'must_change_password', False):
+            allowed = {'/api/auth/password', '/api/auth/logout', '/api/auth/status'}
+            if request.path.startswith('/api/') and request.path not in allowed:
+                return jsonify({'message': 'Password change required'}), 403
         # Never intercept API calls, assets, or static resources
         if (request.path.startswith('/api/') or 
             request.path.startswith('/assets/') or 
@@ -123,7 +134,7 @@ def expire_access_loop(app):
     while True:
         time.sleep(30)
         with app.app_context():
-            now = datetime.utcnow()
+            now = configured_now()
             cutoff = now - __import__('datetime').timedelta(days=30)
             AuditLog.query.filter(AuditLog.timestamp < cutoff).delete(synchronize_session=False)
             expired = Voucher.query.filter(
@@ -139,6 +150,8 @@ def expire_access_loop(app):
                     network.remove_device_from_ipset(mac_address=device.mac_address)
                     changed = True
             for device in devices:
+                telemetry = network.get_device_telemetry(device.mac_address)
+                device.data_used_mb = telemetry['data_used_mb']
                 if device.access_expires_at and device.access_expires_at <= now:
                     device.is_authenticated = False
                     network.remove_device_from_ipset(mac_address=device.mac_address)
@@ -153,7 +166,7 @@ def expire_access_loop(app):
                     changed = True
                     continue
                 if user.time_window_start and user.time_window_end:
-                    current = datetime.utcnow().time()
+                    current = configured_now().time()
                     start = clock_time.fromisoformat(user.time_window_start)
                     end = clock_time.fromisoformat(user.time_window_end)
                     in_window = start <= current <= end if start <= end else current >= start or current <= end
@@ -176,7 +189,7 @@ def start_expiry_worker(app):
 def initialize_database(app):
     with app.app_context():
         db.create_all()
-        from models import RegisteredService, User, Device, TrustedDevice
+        from models import RegisteredService, User, Device, TrustedDevice, Setting
         columns = {column['name'] for column in inspect(db.engine).get_columns('device')}
         if 'access_expires_at' not in columns:
             db.session.execute(text('ALTER TABLE device ADD COLUMN access_expires_at DATETIME'))
@@ -187,24 +200,18 @@ def initialize_database(app):
             admin.set_password(password)
             db.session.add(admin)
             db.session.commit()
-            logging.getLogger(__name__).warning('Initial admin password: %s', password)
             password_file = Path(os.environ.get('NIGEL_ADMIN_PASSWORD_FILE', '/var/lib/nigel-server/admin-password'))
             password_file.parent.mkdir(parents=True, exist_ok=True)
             password_file.write_text(password + '\n', encoding='ascii')
             password_file.chmod(0o600)
+            logging.getLogger(__name__).warning('Initial admin password written to %s', password_file)
 
         service_host = urlparse(app.config['PORTAL_ORIGIN']).hostname or 'localhost'
         default_services = [
-                RegisteredService(name='SSH', description='Secure shell administration', url=f'ssh://{service_host}:22', icon='terminal', check_port=22),
                 RegisteredService(name='Samba Share', description='Local file server', url=f'smb://{service_host}/share', icon='folder', check_port=445),
                 RegisteredService(name='File Browser', description='Web file manager', url=f'http://{service_host}:80', icon='folder', check_port=80),
                 RegisteredService(name='MiniDLNA', description='Media streaming', url=f'http://{service_host}:8200', icon='film', check_port=8200),
                 RegisteredService(name='qBittorrent', description='Download manager', url=f'http://{service_host}:8080', icon='download', check_port=8080),
-                RegisteredService(name='Homepage', description='Docker service dashboard', url=f'http://{service_host}:3002', icon='home', check_port=3002),
-                RegisteredService(name='Uptime Kuma', description='Service monitoring', url=f'http://{service_host}:3003', icon='activity', check_port=3003),
-                RegisteredService(name='Netdata', description='System monitoring', url=f'http://{service_host}:19999', icon='chart', check_port=19999),
-                RegisteredService(name='Inaetia Studio', description='Node application', url=f'http://{service_host}:3000', icon='code', check_port=3000),
-                RegisteredService(name='Node App', description='Node application', url=f'http://{service_host}:3001', icon='code', check_port=3001),
                 RegisteredService(name='Plex', description='Media server', url=f'http://{service_host}:32400/web', icon='film', check_port=32400),
                 RegisteredService(name='Jellyfin', description='Media server', url=f'http://{service_host}:8096', icon='film', check_port=8096),
             ]
@@ -213,6 +220,15 @@ def initialize_database(app):
         if missing_services:
             db.session.bulk_save_objects(missing_services)
             db.session.commit()
+        defaults = {
+            'portal_name': os.environ.get('PORTAL_NAME', 'Captive Portal'),
+            'guest_enabled': 'false', 'guest_default_hours': '2', 'guest_max_hours': '24',
+            'registration_enabled': 'true', 'vouchers_enabled': 'true'
+        }
+        for key, value in defaults.items():
+            if db.session.get(Setting, key) is None:
+                db.session.add(Setting(key=key, value=value))
+        db.session.commit()
 
         network.apply_iptables_rules()
         for device in Device.query.filter_by(is_authenticated=True, is_blocked=False).all():

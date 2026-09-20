@@ -9,6 +9,7 @@ ENV_FILE=/etc/nigel/nigel.env
 : "${NIGEL_WIFI_PREFIX:?NIGEL_WIFI_PREFIX is missing}"
 : "${NIGEL_ROOT:?NIGEL_ROOT is missing}"
 : "${NIGEL_STATE_DIR:?NIGEL_STATE_DIR is missing}"
+: "${NIGEL_WIFI_SUBNET:?NIGEL_WIFI_SUBNET is missing}"
 DNSMASQ_CONF="$NIGEL_STATE_DIR/dnsmasq.conf"
 
 require_root() { [[ $EUID -eq 0 ]] || { echo 'Run as root.' >&2; exit 1; }; }
@@ -34,7 +35,7 @@ wait_for_address() {
 }
 
 stop_hotspot_services() {
-  systemctl stop nigel-server.service dnsmasq.service hostapd.service 2>/dev/null || true
+  systemctl stop nigel-server.service nigel-dnsmasq.service nigel-hostapd.service dnsmasq.service hostapd.service 2>/dev/null || true
 }
 
 stop_client_daemons() {
@@ -62,13 +63,20 @@ start_client_mode() {
   if systemctl is-active --quiet NetworkManager; then
     nmcli device set "$WIFI_IFACE" managed no 2>/dev/null || true
   elif systemctl is-active --quiet systemd-networkd; then
-    systemctl stop systemd-networkd.service 2>/dev/null || true
     networkctl down "$WIFI_IFACE" 2>/dev/null || true
   fi
   set_client_managed
+  sysctl -w "net.ipv6.conf.$WIFI_IFACE.disable_ipv6=0" >/dev/null 2>&1 || true
   [[ -r /etc/wpa_supplicant.conf ]] || { echo 'Missing /etc/wpa_supplicant.conf; cannot restore client mode' >&2; return 1; }
   wpa_supplicant -B -i "$WIFI_IFACE" -c /etc/wpa_supplicant.conf
-  timeout 45 dhclient -1 -q "$WIFI_IFACE"
+  if command -v dhclient >/dev/null 2>&1; then
+    timeout 45 dhclient -1 -q "$WIFI_IFACE"
+  elif command -v networkctl >/dev/null 2>&1 && systemctl is-active --quiet systemd-networkd; then
+    networkctl renew "$WIFI_IFACE"
+  else
+    echo 'No DHCP client available to restore client mode.' >&2
+    return 1
+  fi
   ip -4 -o addr show dev "$WIFI_IFACE" | grep -q . || { echo 'dhclient did not assign a client address' >&2; return 1; }
 }
 
@@ -104,7 +112,6 @@ ap_on() {
     nmcli device disconnect "$WIFI_IFACE" 2>/dev/null || true
     nmcli device set "$WIFI_IFACE" managed no 2>/dev/null || true
   elif systemctl is-active --quiet systemd-networkd; then
-    systemctl stop systemd-networkd.service 2>/dev/null || true
     networkctl down "$WIFI_IFACE" 2>/dev/null || true
   fi
   ip addr flush dev "$WIFI_IFACE"
@@ -114,14 +121,15 @@ ap_on() {
   ip addr add "$NIGEL_WIFI_IP/$NIGEL_WIFI_PREFIX" dev "$WIFI_IFACE"
   ip link set dev "$WIFI_IFACE" up
   wait_for_address || rollback_client
+  sysctl -w "net.ipv6.conf.$WIFI_IFACE.disable_ipv6=1" >/dev/null
   dnsmasq --test --conf-file="$DNSMASQ_CONF" --conf-dir= || rollback_client
-  if ! systemctl start hostapd.service; then
-    journalctl -u hostapd.service -n 50 --no-pager || true
+  if ! systemctl start nigel-hostapd.service; then
+    journalctl -u nigel-hostapd.service -n 50 --no-pager || true
     rollback_client
   fi
   wait_for_type AP || rollback_client
-  if ! systemctl start dnsmasq.service; then
-    journalctl -u dnsmasq.service -n 50 --no-pager || true
+  if ! systemctl start nigel-dnsmasq.service; then
+    journalctl -u nigel-dnsmasq.service -n 50 --no-pager || true
     rollback_client
   fi
   if ! systemctl start nigel-server.service; then
@@ -135,9 +143,6 @@ ap_on() {
 ap_off() {
   require_root
   if start_client_mode; then
-    if [[ "${NIGEL_HOTSPOT_UNIT:-0}" != 1 ]]; then
-      systemctl disable nigel-hotspot.service 2>/dev/null || true
-    fi
     echo "Hotspot is off; $WIFI_IFACE returned to client mode."
   else
     echo "Hotspot is off, but client mode could not be verified." >&2
@@ -145,16 +150,45 @@ ap_off() {
   fi
 }
 
+boot_mode() {
+  require_root
+  case "${1:-}" in
+    hotspot) systemctl enable nigel-hotspot.service ;;
+    client) systemctl disable nigel-hotspot.service ;;
+    *) echo 'Usage: nigel-hotspot boot hotspot|client' >&2; return 2 ;;
+  esac
+}
+
+confirm_try() {
+  require_root
+  rm -f /etc/nigel/try-active /etc/nigel/try-deadline
+  echo 'Hotspot try confirmed.'
+}
+
+try_on() {
+  local seconds=${1:-120}
+  [[ $seconds =~ ^[0-9]+$ && $seconds -gt 0 ]] || { echo 'Seconds must be a positive integer' >&2; return 2; }
+  ap_on
+  date -d "+$seconds seconds" +%s > /etc/nigel/try-deadline
+  touch /etc/nigel/try-active
+  ( sleep "$seconds"; [[ -e /etc/nigel/try-active ]] && /usr/local/sbin/nigel-hotspot off ) &
+  echo "Hotspot try active for $seconds seconds. Run nigel-hotspot confirm after verifying access."
+}
+
 status() {
   concurrency_report
   ip -brief addr show dev "$WIFI_IFACE" || true
   iw dev "$WIFI_IFACE" info || true
   iw dev "$WIFI_IFACE" link || true
-  systemctl --no-pager --full status hostapd dnsmasq nigel-server 2>/dev/null || true
+  systemctl --no-pager --full status nigel-hotspot nigel-hostapd nigel-dnsmasq nigel-server 2>/dev/null || true
 }
 
 case "${1:-status}" in
-  on) ap_on ;;
+  boot) boot_mode "${2:-}" ;;
+  confirm) confirm_try ;;
+  on) if [[ "${2:-}" == '--try' ]]; then try_on "${3:-120}"; else ap_on; fi ;;
+  prepare) require_root; stop_client_daemons; ip addr flush dev "$WIFI_IFACE"; ip link set dev "$WIFI_IFACE" down; iw dev "$WIFI_IFACE" set type __ap; wait_for_type AP; ip addr add "$NIGEL_WIFI_IP/$NIGEL_WIFI_PREFIX" dev "$WIFI_IFACE"; ip link set dev "$WIFI_IFACE" up; wait_for_address; sysctl -w "net.ipv6.conf.$WIFI_IFACE.disable_ipv6=1" >/dev/null ;;
+  release) ip link set dev "$WIFI_IFACE" down 2>/dev/null || true ;;
   off) ap_off ;;
   status) status ;;
   *) echo 'Usage: nigel-hotspot on|off|status' >&2; exit 2 ;;

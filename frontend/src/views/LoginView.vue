@@ -2,7 +2,7 @@
   <div class="login-container">
     <div class="card login-card">
       <div class="text-center mb-8">
-        <h1 class="brand-logo">Nigel<span>Server</span></h1>
+        <h1 class="brand-logo">{{ portalName }}</h1>
         <p class="text-muted mt-2">Sign in to access the network</p>
       </div>
 
@@ -114,6 +114,7 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { io } from 'socket.io-client'
+import { loadPortalConfig, portalName } from '../config'
 
 const router = useRouter()
 const mode = ref('login') // login, voucher, request
@@ -162,6 +163,7 @@ function startApprovalWatcher() {
 }
 
 onMounted(() => {
+  loadPortalConfig()
   checkAuthStatus()
   try {
     socket = io()

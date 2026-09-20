@@ -1,0 +1,26 @@
+# Copy to /etc/nigel/nigel.conf and edit for this deployment.
+NIGEL_PROFILE=standalone-ap
+AP_IFACE=
+CLIENT_IFACE=
+WAN_IFACE=
+SUBNET=10.0.0.0/24
+DHCP_START=10.0.0.10
+DHCP_END=10.0.0.250
+LEASE_TIME=12h
+SSID=Captive Portal
+WIFI_PASSPHRASE_FILE=/etc/nigel/wifi-passphrase
+COUNTRY_CODE=
+BAND=g
+CHANNEL=6
+PORTAL_NAME=Nigel Server
+STRICT=1
+GUEST_ENABLED=false
+GUEST_DEFAULT_HOURS=2
+GUEST_MAX_HOURS=24
+NIGEL_TIMEZONE=system
+STATE_DIR=/var/lib/nigel-server
+NETWORK_BACKEND=auto
+SERVICES_FILE=/etc/nigel/services.json
+UPSTREAM_DNS=
+AP_CONCURRENT=0
+BOOT_MODE=hotspot

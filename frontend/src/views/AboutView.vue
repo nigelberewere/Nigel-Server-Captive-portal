@@ -1,7 +1,7 @@
 <template>
   <div class="container about-page">
     <header class="flex justify-between items-center mb-8">
-      <h1 class="brand-logo">Nigel<span>Server</span></h1>
+      <h1 class="brand-logo">{{ portalName }}</h1>
       <router-link to="/hub" class="btn btn-secondary">Back</router-link>
     </header>
     <section class="card">
@@ -17,6 +17,13 @@
     </section>
   </div>
 </template>
+
+<script setup>
+import { onMounted } from 'vue'
+import { loadPortalConfig, portalName } from '../config'
+
+onMounted(loadPortalConfig)
+</script>
 
 <style scoped>
 .rules-list {

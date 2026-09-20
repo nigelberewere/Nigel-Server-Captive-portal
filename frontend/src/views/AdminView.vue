@@ -1,7 +1,7 @@
 <template>
   <div class="container">
     <header class="flex justify-between items-center mb-8">
-      <h1 class="brand-logo">Nigel<span>Admin</span></h1>
+      <h1 class="brand-logo">{{ portalName }} Admin</h1>
       <button @click="logout" class="btn btn-secondary">Logout</button>
     </header>
 
@@ -246,6 +246,7 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { io } from 'socket.io-client'
 import { Chart, BarController, BarElement, CategoryScale, LinearScale, Tooltip, Legend } from 'chart.js'
+import { loadPortalConfig, portalName } from '../config'
 
 Chart.register(BarController, BarElement, CategoryScale, LinearScale, Tooltip, Legend)
 
@@ -465,6 +466,7 @@ async function logout() {
 let pollTimer = null
 
 onMounted(() => {
+  loadPortalConfig()
   fetchDevices()
   fetchUsers()
   fetchVouchers()
