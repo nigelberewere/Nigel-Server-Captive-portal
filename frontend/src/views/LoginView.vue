@@ -185,6 +185,12 @@ async function checkAuthStatus() {
 
 function startApprovalWatcher() {
   if (approvalWatcherTimer) clearInterval(approvalWatcherTimer)
+  if (!socket) {
+    try {
+      socket = io()
+      socket.on('user_approved', () => checkAuthStatus())
+    } catch (e) {}
+  }
   // Poll every 2 seconds until approved
   approvalWatcherTimer = setInterval(checkAuthStatus, 2000)
 }
@@ -193,10 +199,6 @@ onMounted(() => {
   loadPortalConfig()
   if (sessionStorage.getItem('nigel-password-change-required') === '1') mode.value = 'forced-password'
   checkAuthStatus()
-  try {
-    socket = io()
-    socket.on('user_approved', () => checkAuthStatus())
-  } catch (e) {}
 })
 
 onUnmounted(() => {
