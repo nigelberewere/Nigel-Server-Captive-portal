@@ -29,5 +29,7 @@ def test_nat_authenticated_path_returns():
         with patch.object(network, 'WIFI_IFACE', 'wlp1s0'), patch.object(network, 'WIFI_IP', '10.0.0.1'), patch.object(network, 'WIFI_SUBNET', '10.0.0.0/24'), patch.object(network, '_hotspot_active', return_value=True), patch.object(network, '_default_route_iface', return_value=None):
             network._configure_chains()
     nat_rules = restore.call_args_list[0].args[2]
+    assert nat_rules[0].find('generate_204') >= 0
+    assert nat_rules[-3].find('RETURN') >= 0
     assert any('-j RETURN' in rule for rule in nat_rules)
     assert not any('-j ACCEPT' in rule for rule in nat_rules)
