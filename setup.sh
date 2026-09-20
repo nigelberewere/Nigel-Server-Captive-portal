@@ -1,90 +1,207 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "Setting up Nigel Server..."
+ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+STATE_DIR=/etc/nigel
+ENV_FILE=$STATE_DIR/nigel.env
+WIFI_IFACE=${WIFI_IFACE:-}
+SKIP_FRONTEND_BUILD=${SKIP_FRONTEND_BUILD:-0}
 
-# 1. Update and install system dependencies
-sudo apt update
-sudo apt install -y python3 python3-venv python3-pip iptables ipset dnsmasq hostapd nodejs npm
+usage() {
+  cat <<'EOF'
+Usage:
+  sudo ./setup.sh install          Install packages, Python dependencies, and frontend assets.
+  sudo ./setup.sh enable-hotspot   Configure and activate the Wi-Fi hotspot.
 
-# 2. Setup Python environment
-python3 -m venv venv
-source venv/bin/activate
-pip install -r backend/requirements.txt
+The commands are intentionally separate: install requires internet and never changes
+network configuration; enable-hotspot switches the selected Wi-Fi card to AP mode.
+EOF
+}
 
-# 3. Setup Frontend
-cd frontend
-npm install
-npm run build
-cd ..
+require_root() { [[ $EUID -eq 0 ]] || { echo 'Run as root: sudo ./setup.sh ...' >&2; exit 1; }; }
+require_ubuntu() {
+  command -v apt-get >/dev/null || { echo 'Ubuntu apt-get is required' >&2; exit 1; }
+  . /etc/os-release
+  [[ ${ID:-} == ubuntu ]] || { echo 'Ubuntu is required' >&2; exit 1; }
+  case ${VERSION_ID:-} in 22.04|24.04|26.04) ;; *) echo 'Supported Ubuntu versions: 22.04, 24.04, 26.04' >&2; exit 1 ;; esac
+}
 
-# 4. Detect Wi-Fi interface and copy config templates
-WIFI_IFACE=$(ls /sys/class/net | grep -E '^wl|^wlan' | head -n 1)
-if [ -z "$WIFI_IFACE" ]; then
-    echo "Warning: Could not detect Wi-Fi interface. Falling back to wlan0."
-    WIFI_IFACE="wlan0"
-else
-    echo "Detected Wi-Fi interface: $WIFI_IFACE"
-fi
+install_phase() {
+  require_root
+  require_ubuntu
+  bash "$ROOT_DIR/scripts/preflight.sh" || echo 'Preflight reported issues; review them before enabling the hotspot.'
+  systemctl mask --runtime dnsmasq.service hostapd.service 2>/dev/null || true
+  trap 'systemctl unmask dnsmasq.service hostapd.service 2>/dev/null || true' EXIT
+  apt-get update
+  apt-get install -y python3 python3-venv python3-pip iptables ipset dnsmasq hostapd iw wpa-supplicant isc-dhcp-client curl gettext-base build-essential
+  if ! command -v node >/dev/null 2>&1 || (( $(node -p 'process.versions.node.split(".")[0]') < 18 )); then
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    apt-get install -y nodejs
+  fi
+  python3 -m venv "$ROOT_DIR/venv"
+  "$ROOT_DIR/venv/bin/pip" install --upgrade pip
+  "$ROOT_DIR/venv/bin/pip" install -r "$ROOT_DIR/backend/requirements.txt"
+  if [[ $SKIP_FRONTEND_BUILD != 1 ]]; then
+    if [[ -f "$ROOT_DIR/frontend/package-lock.json" ]]; then
+      (cd "$ROOT_DIR/frontend" && npm ci && npm run build)
+    else
+      (cd "$ROOT_DIR/frontend" && npm install && npm run build)
+    fi
+  fi
+  [[ -f "$ROOT_DIR/frontend/dist/index.html" ]] || { echo 'frontend/dist/index.html is missing; build it or set SKIP_FRONTEND_BUILD=1'; exit 1; }
+  install -d -m 0755 "$STATE_DIR" /var/lib/nigel-server
+  trap - EXIT
+  systemctl unmask dnsmasq.service hostapd.service 2>/dev/null || true
+  echo "Install complete. Run: sudo $ROOT_DIR/setup.sh enable-hotspot"
+}
 
-sed "s|interface=wlan0|interface=$WIFI_IFACE|g" config_templates/dnsmasq.conf | sudo tee /etc/dnsmasq.conf > /dev/null
-sed "s|interface=wlan0|interface=$WIFI_IFACE|g" config_templates/hostapd.conf | sudo tee /etc/hostapd/hostapd.conf > /dev/null
-sed -i "s|WIFI_IFACE = \"wlan0\"|WIFI_IFACE = \"$WIFI_IFACE\"|g" backend/network.py
+enable_phase() {
+  require_root
+  require_ubuntu
+  command -v envsubst >/dev/null || { echo 'gettext-base is missing; run setup.sh install first' >&2; exit 1; }
+  [[ -x "$ROOT_DIR/venv/bin/python" ]] || { echo 'Python environment missing; run setup.sh install first' >&2; exit 1; }
+  [[ -f "$ROOT_DIR/frontend/dist/index.html" ]] || { echo 'frontend/dist/index.html missing; run setup.sh install or provide a prebuilt dist' >&2; exit 1; }
 
-# Assign the static IP to the interface immediately
-sudo ip link set $WIFI_IFACE up
-sudo ip addr flush dev $WIFI_IFACE
-sudo ip addr add 10.0.0.1/24 dev $WIFI_IFACE || true
+  if [[ -z $WIFI_IFACE ]]; then
+    WIFI_IFACE=$(find /sys/class/net -maxdepth 1 -type l -printf '%f\n' | grep -E '^(wl|wlan)' | head -n 1 || true)
+  fi
+  [[ -n $WIFI_IFACE ]] || { echo 'No Wi-Fi interface found; set WIFI_IFACE=wlo1' >&2; exit 1; }
+  [[ $WIFI_IFACE =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || { echo 'Invalid Wi-Fi interface' >&2; exit 1; }
+  iw dev "$WIFI_IFACE" info >/dev/null 2>&1 || { echo "Wi-Fi interface not found: $WIFI_IFACE" >&2; exit 1; }
+  iw list | awk '/valid interface combinations:/,/Supported commands:/' | grep -q AP || { echo 'The Wi-Fi card does not advertise AP mode' >&2; exit 1; }
 
-# 1. Tell NetworkManager to ignore the Wi-Fi interface if NM exists
-if [ -d /etc/NetworkManager/conf.d ]; then
-    echo -e "[keyfile]\nunmanaged-devices=interface-name:$WIFI_IFACE" | sudo tee /etc/NetworkManager/conf.d/99-unmanaged-wlan.conf > /dev/null
-    sudo systemctl restart NetworkManager 2>/dev/null || true
-fi
+  local wifi_ip=10.0.0.1 wifi_prefix=24 ssid passphrase existing_passphrase escaped
+  ssid=${WIFI_SSID:-Nigel Server}
+  existing_passphrase=''
+  if [[ -r /etc/hostapd/hostapd.conf ]]; then
+    existing_passphrase=$(awk -F= '$1 == "wpa_passphrase" {print substr($0, index($0, "=") + 1); exit}' /etc/hostapd/hostapd.conf)
+  fi
+  read -r -s -p 'WPA2 passphrase (Enter keeps the existing passphrase; type OPEN for open network): ' passphrase
+  printf '\n'
+  if [[ -z $passphrase ]]; then passphrase=$existing_passphrase; fi
+  if [[ $passphrase == OPEN ]]; then passphrase=''; fi
+  if [[ -n $passphrase && ( ${#passphrase} -lt 8 || ${#passphrase} -gt 63 || $passphrase == *$'\n'* ) ]]; then
+    echo 'WPA2 passphrase must be 8-63 characters and contain no newline.' >&2
+    exit 1
+  fi
+  [[ $ssid != *$'\n'* ]] || { echo 'SSID cannot contain a newline.' >&2; exit 1; }
+  install -d -m 0755 "$STATE_DIR" /var/lib/nigel-server /etc/hostapd
+  umask 077
+  write_env_value() {
+    local key=$1 value=$2
+    escaped=${value//\\/\\\\}
+    escaped=${escaped//\"/\\\"}
+    escaped=${escaped//\$/\\\$}
+    escaped=${escaped//\`/\\\`}
+    printf '%s="%s"\n' "$key" "$escaped"
+  }
+  {
+    write_env_value WIFI_IFACE "$WIFI_IFACE"
+    write_env_value NIGEL_WIFI_IP "$wifi_ip"
+    write_env_value NIGEL_WIFI_PREFIX "$wifi_prefix"
+    write_env_value NIGEL_WIFI_NETMASK '255.255.255.0'
+    write_env_value NIGEL_DHCP_START '10.0.0.10'
+    write_env_value NIGEL_DHCP_END '10.0.0.250'
+    write_env_value NIGEL_STRICT '1'
+    write_env_value WIFI_SSID "$ssid"
+    write_env_value WIFI_PASSPHRASE "$passphrase"
+    write_env_value PORTAL_ORIGIN "http://$wifi_ip:5000"
+    write_env_value NIGEL_STATE_DIR '/var/lib/nigel-server'
+    write_env_value NIGEL_ROOT "$ROOT_DIR"
+  } > "$ENV_FILE"
+  chmod 0600 "$ENV_FILE"
+  set -a
+  . "$ENV_FILE"
+  set +a
 
-# Stop any wpa_supplicant client that might hold the interface
-sudo systemctl stop wpa_supplicant 2>/dev/null || true
+  envsubst < "$ROOT_DIR/config_templates/dnsmasq.conf" > "$STATE_DIR/dnsmasq.conf"
+  envsubst < "$ROOT_DIR/config_templates/hostapd.conf" > /etc/hostapd/hostapd.conf
+  if [[ -n $WIFI_PASSPHRASE ]]; then
+    cat >> /etc/hostapd/hostapd.conf <<EOF
+wpa=2
+wpa_passphrase=$WIFI_PASSPHRASE
+wpa_key_mgmt=WPA-PSK
+rsn_pairwise=CCMP
+EOF
+  fi
 
-# 2. Add automatic network restore service that runs AFTER hostapd
-sudo tee /etc/systemd/system/restore-wifi-ip.service > /dev/null << EOF
+  # Ignore every old dnsmasq.d fragment, including ubuntu-fan, for this dedicated hotspot.
+  if [[ -e /etc/default/dnsmasq ]]; then cp -a /etc/default/dnsmasq "/etc/default/dnsmasq.nigel-backup.$(date +%s)"; fi
+  printf '%s\n' 'CONFIG_DIR=' > /etc/default/dnsmasq
+  dnsmasq --test --conf-file="$STATE_DIR/dnsmasq.conf" --conf-dir=
+
+  install -m 0755 "$ROOT_DIR/scripts/nigel-hotspot" /usr/local/sbin/nigel-hotspot
+  legacy_backup="/root/nigel-backup-$(date +%Y%m%d-%H%M%S)"
+  install -d -m 0700 "$legacy_backup"
+  systemctl stop nigelserver-boot.service 2>/dev/null || true
+  systemctl disable nigelserver-boot.service 2>/dev/null || true
+  rm -f /etc/systemd/system/nigelserver-boot.service
+  for legacy_script in /home/nigel/nigelserver-on.sh /home/nigel/nigelserver-off.sh /home/nigel/internet-on.sh /home/nigel/internet-off.sh; do
+    if [[ -e "$legacy_script" ]]; then
+      cp -a "$legacy_script" "$legacy_backup/"
+      rm -f "$legacy_script"
+    fi
+  done
+  cat > /etc/systemd/system/nigel-server.service <<EOF
 [Unit]
-Description=Set Static IP for Captive Portal
-After=hostapd.service
-Before=dnsmasq.service
-BindsTo=hostapd.service
+Description=Nigel Server Captive Portal Backend
+After=network-online.target hostapd.service dnsmasq.service
+Wants=network-online.target
 
 [Service]
-Type=oneshot
-ExecStart=/usr/bin/ip link set dev $WIFI_IFACE up
-ExecStart=/usr/bin/ip addr flush dev $WIFI_IFACE
-ExecStart=/usr/bin/ip addr add 10.0.0.1/24 dev $WIFI_IFACE
+User=root
+WorkingDirectory=$ROOT_DIR/backend
+EnvironmentFile=$ENV_FILE
+ExecStart=$ROOT_DIR/venv/bin/python app.py
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 EOF
+  install -d -m 0755 /etc/systemd/system/hostapd.service.d /etc/systemd/system/dnsmasq.service.d
+  cat > /etc/systemd/system/hostapd.service.d/nigel.conf <<EOF
+[Unit]
+After=network-online.target
+Wants=network-online.target
+[Service]
+Restart=on-failure
+RestartSec=2
+EOF
+  cat > /etc/systemd/system/dnsmasq.service.d/nigel.conf <<EOF
+[Unit]
+After=hostapd.service
+[Service]
+Type=simple
+PIDFile=
+ExecStart=
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --conf-file=$STATE_DIR/dnsmasq.conf --conf-dir=
+Restart=on-failure
+RestartSec=2
+EOF
+  cat > /etc/systemd/system/nigel-hotspot.service <<EOF
+[Unit]
+Description=Nigel Server hotspot lifecycle
+After=network.target
+Before=hostapd.service dnsmasq.service nigel-server.service
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=NIGEL_HOTSPOT_UNIT=1
+ExecStart=/usr/local/sbin/nigel-hotspot on
+ExecStop=/usr/local/sbin/nigel-hotspot off
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable nigel-hotspot.service
+  systemctl start nigel-hotspot.service
+  systemctl --no-pager --full status nigel-hotspot.service hostapd dnsmasq nigel-server
+  printf 'Hotspot enabled on %s. To return to client Wi-Fi: sudo nigel-hotspot off\n' "$WIFI_IFACE"
+}
 
-sudo systemctl daemon-reload
-sudo systemctl enable restore-wifi-ip.service
-
-# 3. Start hostapd FIRST, assign IP, then start dnsmasq
-sudo systemctl unmask hostapd 2>/dev/null || true
-sudo systemctl enable hostapd dnsmasq
-sudo systemctl restart hostapd
-sleep 1
-
-sudo ip link set dev $WIFI_IFACE up
-sudo ip addr flush dev $WIFI_IFACE
-sudo ip addr add 10.0.0.1/24 dev $WIFI_IFACE
-sudo systemctl restart dnsmasq
-
-# 4.5. Configure Sudoers for iptables/ipset
-echo -e "root ALL=(ALL) NOPASSWD: ALL\nnigel ALL=(ALL) NOPASSWD: /sbin/iptables, /sbin/ipset, /usr/sbin/iptables, /usr/sbin/ipset, /bin/systemctl, /sbin/sysctl, /usr/sbin/sysctl" | sudo tee /etc/sudoers.d/nigel
-sudo chmod 0440 /etc/sudoers.d/nigel
-
-# 5. Setup Systemd Service dynamically with the current path
-sed "s|/opt/nigel-server|$PWD|g" config_templates/nigel-server.service | sudo tee /etc/systemd/system/nigel-server.service > /dev/null
-sudo systemctl daemon-reload
-sudo systemctl enable nigel-server
-sudo systemctl start nigel-server
-
-echo "Setup complete. Please verify /etc/dnsmasq.conf and /etc/hostapd/hostapd.conf."
+case "${1:-}" in
+  install) install_phase ;;
+  enable-hotspot) enable_phase ;;
+  *) usage; exit 2 ;;
+esac

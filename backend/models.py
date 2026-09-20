@@ -1,10 +1,10 @@
 from flask_login import UserMixin
-from datetime import datetime
+from datetime import datetime, timezone
 from extensions import db, bcrypt, login_manager
 
 @login_manager.user_loader
 def load_user(user_id):
-    return User.query.get(int(user_id))
+    return db.session.get(User, int(user_id))
 
 class User(UserMixin, db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -12,7 +12,8 @@ class User(UserMixin, db.Model):
     password_hash = db.Column(db.String(128), nullable=False)
     role = db.Column(db.String(20), default='user') # admin, user, guest, pending
     is_approved = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    must_change_password = db.Column(db.Boolean, default=False, nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     
     # Quotas and Limits
     quota_mb = db.Column(db.Integer, nullable=True) # Max MB allowed per session or globally
@@ -26,6 +27,15 @@ class User(UserMixin, db.Model):
         return bcrypt.check_password_hash(self.password_hash, password)
 
 
+class PasswordResetToken(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    token_hash = db.Column(db.String(64), unique=True, nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    used_at = db.Column(db.DateTime, nullable=True)
+    user = db.relationship('User', backref=db.backref('reset_tokens', lazy=True))
+
+
 class Device(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     mac_address = db.Column(db.String(17), unique=True, nullable=False)
@@ -35,17 +45,25 @@ class Device(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
     user = db.relationship('User', backref=db.backref('devices', lazy=True))
     
-    connected_at = db.Column(db.DateTime, default=datetime.utcnow)
-    last_seen = db.Column(db.DateTime, default=datetime.utcnow)
+    connected_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    last_seen = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     
     data_used_mb = db.Column(db.Float, default=0.0)
     is_blocked = db.Column(db.Boolean, default=False)
     is_authenticated = db.Column(db.Boolean, default=False)
+    access_expires_at = db.Column(db.DateTime, nullable=True)
+
+
+class TrustedDevice(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    mac_address = db.Column(db.String(17), unique=True, nullable=False)
+    label = db.Column(db.String(120), nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
 
 class AuditLog(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+    timestamp = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     action = db.Column(db.String(100), nullable=False)
     details = db.Column(db.Text, nullable=True)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True)
@@ -61,7 +79,7 @@ class Voucher(db.Model):
     duration_hours = db.Column(db.Integer, nullable=True)
     quota_mb = db.Column(db.Integer, nullable=True)
     used_by_device = db.Column(db.String(17), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
 class RegisteredService(db.Model):
     id = db.Column(db.Integer, primary_key=True)

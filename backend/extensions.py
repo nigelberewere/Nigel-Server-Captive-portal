@@ -4,6 +4,6 @@ from flask_login import LoginManager
 from flask_bcrypt import Bcrypt
 
 db = SQLAlchemy()
-socketio = SocketIO(cors_allowed_origins="*")
+socketio = SocketIO(async_mode='threading')
 login_manager = LoginManager()
 bcrypt = Bcrypt()

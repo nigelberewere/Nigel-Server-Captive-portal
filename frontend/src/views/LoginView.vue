@@ -27,8 +27,32 @@
             <a href="#" @click.prevent="setMode('voucher')">Use a Voucher</a>
             <span class="text-muted">•</span>
             <a href="#" @click.prevent="setMode('request')">Request Access</a>
+            <span class="text-muted">•</span>
+            <a href="#" @click.prevent="handleGuest">Guest Access</a>
+            <span class="text-muted">•</span>
+            <a href="#" @click.prevent="setMode('reset')">Reset Password</a>
           </div>
         </div>
+      </form>
+
+      <form @submit.prevent="handlePasswordReset" v-if="mode === 'reset'">
+        <div class="input-group">
+          <label>Username</label>
+          <input type="text" v-model.trim="resetData.username" placeholder="Your username" required />
+        </div>
+        <div class="input-group">
+          <label>Reset token</label>
+          <input type="text" v-model.trim="resetData.token" placeholder="Token from the server administrator" required />
+        </div>
+        <div class="input-group">
+          <label>New password</label>
+          <input type="password" v-model="resetData.password" minlength="12" required />
+        </div>
+        <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
+        <div v-if="successMsg" class="success-msg">{{ successMsg }}</div>
+        <button type="button" class="btn btn-secondary w-full mt-4" :disabled="loading" @click="requestPasswordReset">Request reset token</button>
+        <button type="submit" class="btn w-full mt-4" :disabled="loading">Reset password</button>
+        <div class="mt-4 text-center text-sm"><a href="#" @click.prevent="setMode('login')">Back to Login</a></div>
       </form>
 
       <!-- Voucher Form -->
@@ -102,9 +126,9 @@ let approvalWatcherTimer = null
 const loginData = ref({ username: '', password: '' })
 const voucherCode = ref('')
 const requestData = ref({ username: '', password: '' })
+const resetData = ref({ username: '', token: '', password: '' })
 
 const urlParams = new URLSearchParams(window.location.search);
-const mac_address = urlParams.get('mac') || '';
 
 function setMode(newMode) {
   mode.value = newMode
@@ -161,7 +185,7 @@ async function handleLogin() {
     const res = await fetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...loginData.value, mac_address })
+      body: JSON.stringify(loginData.value)
     })
     const data = await res.json()
     if (res.ok) {
@@ -189,7 +213,7 @@ async function handleVoucher() {
     const res = await fetch('/api/auth/voucher', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, mac_address })
+      body: JSON.stringify({ code })
     })
     const data = await res.json()
     if (res.ok) {
@@ -197,6 +221,68 @@ async function handleVoucher() {
     } else {
       errorMsg.value = data.message || 'Invalid voucher'
     }
+  } catch (err) {
+    errorMsg.value = 'Network error. Could not reach server.'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function handleGuest() {
+  clearMessages()
+  loading.value = true
+  try {
+    const res = await fetch('/api/auth/guest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ duration_hours: 2 })
+    })
+    const data = await res.json()
+    if (res.ok) router.push('/hub')
+    else errorMsg.value = data.message || 'Guest access failed'
+  } catch (err) {
+    errorMsg.value = 'Network error. Could not reach server.'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function handlePasswordReset() {
+  clearMessages()
+  loading.value = true
+  try {
+    const res = await fetch('/api/auth/password-reset/confirm', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: resetData.value.token, password: resetData.value.password })
+    })
+    const data = await res.json()
+    if (res.ok) {
+      successMsg.value = data.message
+      resetData.value = { username: '', token: '', password: '' }
+    } else errorMsg.value = data.message || 'Password reset failed'
+  } catch (err) {
+    errorMsg.value = 'Network error. Could not reach server.'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function requestPasswordReset() {
+  clearMessages()
+  if (!resetData.value.username) {
+    errorMsg.value = 'Enter your username first.'
+    return
+  }
+  loading.value = true
+  try {
+    const res = await fetch('/api/auth/password-reset', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: resetData.value.username })
+    })
+    const data = await res.json()
+    successMsg.value = data.message
   } catch (err) {
     errorMsg.value = 'Network error. Could not reach server.'
   } finally {
@@ -215,7 +301,7 @@ async function handleRequest() {
     const res = await fetch('/api/auth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ...requestData.value, mac_address })
+      body: JSON.stringify(requestData.value)
     })
     const data = await res.json()
     if (res.ok) {

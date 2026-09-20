@@ -18,6 +18,21 @@
         <h3 class="text-muted">Pending Approvals</h3>
         <p class="text-2xl mt-2" style="color: var(--primary-color)">{{ pendingUsersCount }}</p>
       </div>
+      <div class="mt-8">
+        <h3>Trusted Devices</h3>
+        <p class="text-muted">These MAC addresses bypass the portal and do not need user login.</p>
+        <div class="flex gap-2 mt-4">
+          <input v-model.trim="trustedMac" placeholder="AA:BB:CC:DD:EE:FF" />
+          <input v-model.trim="trustedLabel" placeholder="Label" />
+          <button class="btn" @click="addTrusted">Add trusted device</button>
+        </div>
+        <ul class="trusted-list mt-4">
+          <li v-for="device in trustedDevices" :key="device.mac_address">
+            <span>{{ device.label || 'Trusted device' }}: {{ device.mac_address }}</span>
+            <button class="btn-small btn-danger" @click="removeTrusted(device.mac_address)">Remove</button>
+          </li>
+        </ul>
+      </div>
     </div>
 
     <!-- Tabs -->
@@ -25,6 +40,7 @@
       <button :class="{ active: currentTab === 'devices' }" @click="currentTab = 'devices'">Live Devices</button>
       <button :class="{ active: currentTab === 'users' }" @click="currentTab = 'users'">User Accounts</button>
       <button :class="{ active: currentTab === 'vouchers' }" @click="currentTab = 'vouchers'">Vouchers</button>
+      <button :class="{ active: currentTab === 'audit' }" @click="currentTab = 'audit'">Audit Log</button>
     </div>
 
     <!-- Devices Tab -->
@@ -42,6 +58,8 @@
               <th>IP Address</th>
               <th>MAC Address</th>
               <th>User/Status</th>
+              <th>Signal</th>
+              <th>Usage</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -56,12 +74,41 @@
                 </span>
               </td>
               <td>
+                <span>{{ device.signal_strength ?? 'n/a' }}{{ device.signal_strength != null ? ' dBm' : '' }}</span>
+              </td>
+              <td>{{ Number(device.data_used_mb || 0).toFixed(1) }} MB</td>
+              <td>
                 <button class="btn-small btn-danger" @click="kickDevice(device.mac_address)">Kick</button>
+                <button class="btn-small" @click="toggleBlock(device)">{{ device.is_blocked ? 'Unblock' : 'Block' }}</button>
               </td>
             </tr>
             <tr v-if="devices.length === 0">
-              <td colspan="5" class="text-center text-muted py-4">No devices connected</td>
+              <td colspan="7" class="text-center text-muted py-4">No devices connected</td>
             </tr>
+          </tbody>
+        </table>
+      </div>
+        <div class="usage-chart" v-if="devices.length">
+          <h3>Current device usage</h3>
+          <canvas ref="usageCanvas" aria-label="Current device usage chart"></canvas>
+        </div>
+    </div>
+
+    <div class="card" v-if="currentTab === 'audit'">
+      <div class="flex justify-between items-center mb-4">
+        <h2>Audit Log</h2>
+        <button class="btn btn-secondary" @click="fetchAudit">Refresh</button>
+      </div>
+      <div class="table-responsive">
+        <table class="w-full text-left">
+          <thead><tr><th>Time</th><th>Action</th><th>Details</th></tr></thead>
+          <tbody>
+            <tr v-for="entry in audit" :key="entry.id">
+              <td>{{ new Date(entry.timestamp).toLocaleString() }}</td>
+              <td>{{ entry.action }}</td>
+              <td class="text-muted">{{ entry.details }}</td>
+            </tr>
+            <tr v-if="audit.length === 0"><td colspan="3" class="text-center text-muted py-4">No audit events</td></tr>
           </tbody>
         </table>
       </div>
@@ -82,6 +129,8 @@
               <th>Role</th>
               <th>Created</th>
               <th>Status</th>
+              <th>Quota (MB)</th>
+              <th>Time Window</th>
               <th>Actions</th>
             </tr>
           </thead>
@@ -96,8 +145,17 @@
                 </span>
               </td>
               <td>
+                <input type="number" min="1" v-model.number="user.quota_mb" placeholder="none" style="width: 90px; padding: 0.4rem" />
+              </td>
+              <td>
+                <input type="time" v-model="user.time_window_start" />
+                <input type="time" v-model="user.time_window_end" />
+              </td>
+              <td>
                 <div class="flex gap-2">
                   <button v-if="!user.is_approved" class="btn-small btn-approve" @click="approveUser(user.id)">Approve</button>
+                  <button class="btn-small" @click="saveLimits(user)">Save limits</button>
+                  <button class="btn-small" @click="resetUserPassword(user.id)">Reset password</button>
                   <button v-if="user.role !== 'admin'" class="btn-small btn-danger" @click="deleteUser(user.id)">Delete</button>
                 </div>
               </td>
@@ -187,12 +245,17 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { io } from 'socket.io-client'
+import { Chart, BarController, BarElement, CategoryScale, LinearScale, Tooltip, Legend } from 'chart.js'
+
+Chart.register(BarController, BarElement, CategoryScale, LinearScale, Tooltip, Legend)
 
 const router = useRouter()
 const currentTab = ref('devices')
 
 // Device State
 const devices = ref([])
+const usageCanvas = ref(null)
+let usageChart = null
 let socket = null
 
 const activeUsersCount = computed(() => devices.value.filter(d => d.is_authenticated).length)
@@ -205,6 +268,10 @@ const newUser = ref({ username: '', password: '', role: 'user' })
 
 // Voucher State
 const vouchers = ref([])
+const audit = ref([])
+const trustedDevices = ref([])
+const trustedMac = ref('')
+const trustedLabel = ref('')
 const voucherCount = ref(1)
 const voucherDuration = ref(24)
 
@@ -212,9 +279,24 @@ const voucherDuration = ref(24)
 async function fetchDevices() {
   try {
     const res = await fetch('/api/admin/devices')
-    if (res.ok) devices.value = await res.json()
+    if (res.ok) {
+      devices.value = await res.json()
+      updateUsageChart()
+    }
     else if (res.status === 401 || res.status === 403) router.push('/login')
   } catch (err) { console.error(err) }
+}
+
+function updateUsageChart() {
+  if (!usageCanvas.value) return
+  const labels = devices.value.map(device => device.hostname || device.mac_address)
+  const values = devices.value.map(device => Number(device.data_used_mb || 0))
+  if (usageChart) usageChart.destroy()
+  usageChart = new Chart(usageCanvas.value, {
+    type: 'bar',
+    data: { labels, datasets: [{ label: 'MB', data: values, backgroundColor: '#f59e0b' }] },
+    options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
+  })
 }
 
 async function fetchUsers() {
@@ -229,6 +311,35 @@ async function fetchVouchers() {
     const res = await fetch('/api/admin/vouchers')
     if (res.ok) vouchers.value = await res.json()
   } catch (err) { console.error(err) }
+}
+
+async function fetchAudit() {
+  try {
+    const res = await fetch('/api/admin/audit')
+    if (res.ok) audit.value = await res.json()
+  } catch (err) { console.error(err) }
+}
+
+async function fetchTrusted() {
+  const res = await fetch('/api/admin/trusted-devices')
+  if (res.ok) trustedDevices.value = await res.json()
+}
+
+async function addTrusted() {
+  const res = await fetch('/api/admin/trusted-devices', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mac_address: trustedMac.value, label: trustedLabel.value })
+  })
+  if (res.ok) {
+    trustedMac.value = ''
+    trustedLabel.value = ''
+    await fetchTrusted()
+  } else alert((await res.json().catch(() => ({}))).message || 'Failed to add trusted device')
+}
+
+async function removeTrusted(mac) {
+  const res = await fetch(`/api/admin/trusted-devices/${encodeURIComponent(mac)}`, { method: 'DELETE' })
+  if (res.ok) await fetchTrusted()
 }
 
 // --- ACTIONS ---
@@ -248,6 +359,13 @@ async function kickDevice(mac) {
   }
 }
 
+async function toggleBlock(device) {
+  const action = device.is_blocked ? 'unblock' : 'block'
+  const res = await fetch(`/api/admin/devices/${encodeURIComponent(device.mac_address)}/${action}`, { method: 'POST' })
+  if (res.ok) await fetchDevices()
+  else alert('Failed to update device block status')
+}
+
 async function approveUser(id) {
   const res = await fetch(`/api/admin/users/${id}/approve`, { method: 'POST' })
   if (res.ok) {
@@ -255,6 +373,29 @@ async function approveUser(id) {
   } else {
     alert('Failed to approve user')
   }
+}
+
+async function saveLimits(user) {
+  const res = await fetch(`/api/admin/users/${user.id}/limits`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      quota_mb: user.quota_mb,
+      time_window_start: user.time_window_start,
+      time_window_end: user.time_window_end
+    })
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    alert(data.message || 'Failed to save limits')
+  }
+}
+
+async function resetUserPassword(id) {
+  const res = await fetch(`/api/admin/users/${id}/reset-password`, { method: 'POST' })
+  const data = await res.json().catch(() => ({}))
+  if (res.ok) alert(`Temporary password: ${data.temporary_password}`)
+  else alert(data.message || 'Failed to reset password')
 }
 
 async function createUser() {
@@ -327,12 +468,15 @@ onMounted(() => {
   fetchDevices()
   fetchUsers()
   fetchVouchers()
+  fetchAudit()
+  fetchTrusted()
   
   try {
     socket = io()
     socket.on('devices_update', () => fetchDevices())
     socket.on('users_update', () => fetchUsers())
     socket.on('vouchers_update', () => fetchVouchers())
+    socket.on('devices_update', () => fetchAudit())
   } catch (e) {
     console.error('Socket error:', e)
   }
@@ -342,12 +486,15 @@ onMounted(() => {
     fetchUsers()
     fetchDevices()
     fetchVouchers()
+    fetchAudit()
+    fetchTrusted()
   }, 3000)
 })
 
 onUnmounted(() => {
   if (pollTimer) clearInterval(pollTimer)
   if (socket) socket.disconnect()
+  if (usageChart) usageChart.destroy()
 })
 </script>
 
@@ -377,6 +524,7 @@ onUnmounted(() => {
 }
 
 .table-responsive { overflow-x: auto; }
+.usage-chart { height: 260px; margin-top: 1.5rem; }
 table { border-collapse: collapse; }
 th, td { padding: 1rem; border-bottom: 1px solid var(--border-color); }
 th { color: var(--text-muted); font-weight: 500; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em; }

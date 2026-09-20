@@ -1,132 +1,318 @@
-import subprocess
+import ipaddress
 import logging
 import os
+import re
+import subprocess
+import threading
+import time
 
 logger = logging.getLogger(__name__)
 
 IPSET_MAC_NAME = "nigel_auth_macs"
-IPSET_IP_NAME = "nigel_auth_ips"
-WIFI_IFACE = "wlan0"  # Will be updated by setup.sh if different
+IPSET_TRUSTED_NAME = "nigel_trusted_macs"
+WIFI_IFACE = os.environ.get("WIFI_IFACE")
+WIFI_IP = os.environ.get("NIGEL_WIFI_IP")
+WIFI_PREFIX = os.environ.get("NIGEL_WIFI_PREFIX", "24")
+STRICT_MODE = os.environ.get("NIGEL_STRICT", "1").lower() not in {"0", "false", "no"}
+MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$", re.IGNORECASE)
+IFACE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
+CHAINS = (
+    ("nat", "NIGEL_NAT", "PREROUTING"),
+    ("filter", "NIGEL_INPUT", "INPUT"),
+    ("filter", "NIGEL_FWD", "FORWARD"),
+    ("filter", "NIGEL_DOCKER_USER", "DOCKER-USER"),
+)
+_watchdog_started = False
 
-def run_cmd(cmd):
+
+def _valid_mac(value):
+    return value.lower() if isinstance(value, str) and MAC_RE.fullmatch(value) else None
+
+
+def _valid_ip(value):
     try:
-        result = subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        return result.stdout.strip()
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"Command failed: {cmd}, error: {e.stderr.strip()}")
+        return str(ipaddress.ip_address(value))
+    except (ValueError, TypeError):
         return None
+
+
+def _valid_iface(value):
+    if not isinstance(value, str) or not IFACE_RE.fullmatch(value):
+        raise ValueError("WIFI_IFACE is not configured or is invalid")
+    return value
+
+
+def _configured_ip():
+    value = _valid_ip(WIFI_IP)
+    if not value:
+        raise ValueError("NIGEL_WIFI_IP is not configured or is invalid")
+    return value
+
+
+def run_cmd(args, check=False, input_text=None):
+    if not isinstance(args, (list, tuple)) or not args:
+        raise ValueError("command must be a non-empty argument list")
+    try:
+        result = subprocess.run(
+            list(args), check=check, input=input_text, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True
+        )
+        if result.returncode and check:
+            logger.warning("Command failed: %s: %s", args, result.stderr.strip())
+        return result.stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        logger.warning("Command failed: %s: %s", args, exc)
+        if check:
+            raise
+        return None
+
+
+def _iptables(table, *args, check=False):
+    command = ["iptables", "-w"]
+    if table:
+        command += ["-t", table]
+    return run_cmd(command + list(args), check=check)
+
+
+def _rule_exists(table, chain, *rule):
+    command = ["iptables", "-w"]
+    if table:
+        command += ["-t", table]
+    result = subprocess.run(command + ["-C", chain, *rule], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return result.returncode == 0
+
+
+def _chain_exists(table, chain):
+    command = ["iptables", "-w"]
+    if table:
+        command += ["-t", table]
+    result = subprocess.run(command + ["-L", chain], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    return result.returncode == 0
+
+
+def _ensure_chain(table, chain, parent):
+    if not _chain_exists(table, chain):
+        _iptables(table, "-N", chain, check=True)
+    if not _rule_exists(table, parent, "-j", chain):
+        _iptables(table, "-I", parent, "1", "-j", chain, check=True)
+
+
+def _restore(table, chain, rules):
+    lines = [f"*{table}", f"-F {chain}"]
+    lines.extend(f"-A {chain} {rule}" for rule in rules)
+    lines.append("COMMIT")
+    run_cmd(["iptables-restore", "--noflush"], check=True, input_text="\n".join(lines) + "\n")
+
+
+def _ipset_restore(entries=(), set_name=IPSET_MAC_NAME):
+    lines = [f"create {set_name} hash:mac family inet -exist"]
+    lines.extend(f"add {set_name} {entry} -exist" for entry in entries)
+    run_cmd(["ipset", "restore"], check=True, input_text="\n".join(lines) + "\n")
+
 
 def get_mac_from_ip(ip_address):
-    """
-    Look up the MAC address of a client IP on the local subnet.
-    Checks /proc/net/arp, dnsmasq leases, and `ip neigh`.
-    """
-    if not ip_address:
+    client_ip = _valid_ip(ip_address)
+    if not client_ip or client_ip in {"127.0.0.1", "::1"}:
         return None
-    if ip_address in ('127.0.0.1', '::1'):
-        return '00:00:00:00:00:01'
-
-    # 1. Check /proc/net/arp
     try:
-        if os.path.exists('/proc/net/arp'):
-            with open('/proc/net/arp', 'r') as f:
-                for line in f.readlines()[1:]:
-                    parts = line.split()
-                    if len(parts) >= 4 and parts[0] == ip_address:
-                        mac = parts[3].strip().lower()
-                        if mac and mac != '00:00:00:00:00:00':
-                            return mac
-    except Exception as e:
-        logger.warning(f"Error reading /proc/net/arp: {e}")
-
-    # 2. Check dnsmasq.leases
-    for lease_path in ['/var/lib/misc/dnsmasq.leases', '/var/lib/dnsmasq/dnsmasq.leases', '/tmp/dnsmasq.leases']:
+        with open("/proc/net/arp", encoding="ascii") as arp:
+            for line in arp.readlines()[1:]:
+                parts = line.split()
+                mac = _valid_mac(parts[3]) if len(parts) >= 4 and parts[0] == client_ip else None
+                if mac and mac != "00:00:00:00:00:00":
+                    return mac
+    except (OSError, UnicodeError) as exc:
+        logger.warning("Error reading ARP table: %s", exc)
+    for lease_path in ("/var/lib/misc/nigel-dnsmasq.leases", "/var/lib/misc/dnsmasq.leases", "/var/lib/dnsmasq/dnsmasq.leases"):
         try:
-            if os.path.exists(lease_path):
-                with open(lease_path, 'r') as f:
-                    for line in f:
-                        parts = line.split()
-                        if len(parts) >= 3 and parts[2] == ip_address:
-                            mac = parts[1].strip().lower()
-                            if mac and mac != '00:00:00:00:00:00':
-                                return mac
-        except Exception:
-            pass
-
-    # 3. Fallback to `ip neigh show`
-    try:
-        out = run_cmd(f"ip neigh show {ip_address}")
-        if out:
-            parts = out.split()
-            if "lladdr" in parts:
-                idx = parts.index("lladdr") + 1
-                if idx < len(parts):
-                    return parts[idx].strip().lower()
-    except Exception as e:
-        logger.warning(f"Error checking ip neigh: {e}")
-
+            with open(lease_path, encoding="ascii") as leases:
+                for line in leases:
+                    parts = line.split()
+                    mac = _valid_mac(parts[1]) if len(parts) >= 3 and parts[2] == client_ip else None
+                    if mac:
+                        return mac
+        except (OSError, UnicodeError):
+            continue
+    result = run_cmd(["ip", "neigh", "show", client_ip])
+    parts = result.split() if result else []
+    if "lladdr" in parts:
+        index = parts.index("lladdr") + 1
+        if index < len(parts):
+            return _valid_mac(parts[index])
     return None
 
+
+def get_device_telemetry(mac_address):
+    mac = _valid_mac(mac_address)
+    if not mac:
+        return {"hostname": None, "data_used_mb": 0.0, "signal_strength": None}
+    hostname = None
+    for lease_path in ("/var/lib/misc/nigel-dnsmasq.leases", "/var/lib/misc/dnsmasq.leases", "/var/lib/dnsmasq/dnsmasq.leases"):
+        try:
+            with open(lease_path, encoding="utf-8") as leases:
+                for line in leases:
+                    parts = line.split()
+                    if len(parts) >= 4 and parts[1].lower() == mac:
+                        hostname = parts[3] if parts[3] != "*" else None
+                        break
+        except OSError:
+            continue
+    signal = None
+    if WIFI_IFACE:
+        station_dump = run_cmd(["iw", "dev", _valid_iface(WIFI_IFACE), "station", "dump"])
+        if station_dump:
+            rows = station_dump.splitlines()
+            for index, row in enumerate(rows):
+                if row.strip().lower().startswith(mac):
+                    for detail in rows[index:index + 12]:
+                        if "signal:" in detail:
+                            try:
+                                signal = int(detail.split("signal:", 1)[1].split()[0])
+                            except (ValueError, IndexError):
+                                pass
+                            break
+    data_used_mb = 0.0
+    rules = run_cmd(["iptables", "-w", "-L", "NIGEL_FWD", "-v", "-n"])
+    if rules:
+        for row in rules.splitlines():
+            if mac in row.lower():
+                fields = row.split()
+                try:
+                    data_used_mb = float(fields[1]) / (1024 * 1024)
+                except (IndexError, ValueError):
+                    pass
+                break
+    return {"hostname": hostname, "data_used_mb": data_used_mb, "signal_strength": signal}
+
+
 def init_ipset():
-    """Create the MAC and IP ipsets if they do not exist."""
-    run_cmd(f"sudo ipset create {IPSET_MAC_NAME} hash:mac -exist")
-    run_cmd(f"sudo ipset create {IPSET_IP_NAME} hash:ip -exist")
+    _ipset_restore()
+    _ipset_restore(set_name=IPSET_TRUSTED_NAME)
+
 
 def add_device_to_ipset(mac_address=None, ip_address=None):
-    """Add an authenticated MAC and/or IP address to the ipset."""
-    if mac_address and ':' in mac_address and len(mac_address) == 17:
-        run_cmd(f"sudo ipset add {IPSET_MAC_NAME} {mac_address} -exist")
-    if ip_address and ip_address not in ('127.0.0.1', '::1', 'localhost'):
-        run_cmd(f"sudo ipset add {IPSET_IP_NAME} {ip_address} -exist")
+    mac = _valid_mac(mac_address)
+    if mac:
+        _ipset_restore([mac])
+
+
+def add_trusted_device(mac_address):
+    mac = _valid_mac(mac_address)
+    if mac:
+        _ipset_restore([mac], IPSET_TRUSTED_NAME)
+
+
+def remove_trusted_device(mac_address):
+    mac = _valid_mac(mac_address)
+    if mac:
+        run_cmd(["ipset", "del", IPSET_TRUSTED_NAME, mac, "-exist"])
+
 
 def remove_device_from_ipset(mac_address=None, ip_address=None):
-    """Remove a MAC and/or IP address from the ipset."""
-    if mac_address and ':' in mac_address:
-        run_cmd(f"sudo ipset del {IPSET_MAC_NAME} {mac_address} -exist")
-    if ip_address and ip_address not in ('127.0.0.1', '::1', 'localhost'):
-        run_cmd(f"sudo ipset del {IPSET_IP_NAME} {ip_address} -exist")
+    mac = _valid_mac(mac_address)
+    if mac:
+        run_cmd(["ipset", "del", IPSET_MAC_NAME, mac, "-exist"])
+
 
 def flush_ipset():
-    """Clear all authenticated MACs and IPs."""
-    run_cmd(f"sudo ipset flush {IPSET_MAC_NAME}")
-    run_cmd(f"sudo ipset flush {IPSET_IP_NAME}")
+    run_cmd(["ipset", "flush", IPSET_MAC_NAME])
+
+
+def _default_route_iface():
+    output = run_cmd(["ip", "route", "show", "default"])
+    if not output:
+        return None
+    parts = output.split()
+    return parts[parts.index("dev") + 1] if "dev" in parts else None
+
+
+def _configure_chains():
+    iface = _valid_iface(WIFI_IFACE)
+    _configured_ip()
+    for table, chain, parent in CHAINS:
+        if parent == "DOCKER-USER" and not _chain_exists(table, parent):
+            logger.info("Docker is not installed; skipping %s", chain)
+            continue
+        _ensure_chain(table, chain, parent)
+
+    _restore("nat", "NIGEL_NAT", [
+        f"-i {iface} -m set --match-set {IPSET_TRUSTED_NAME} src -j RETURN",
+        f"-i {iface} -m set --match-set {IPSET_MAC_NAME} src -j RETURN",
+        f"-i {iface} -p tcp --dport 80 -j REDIRECT --to-ports 5000",
+    ])
+    input_rules = [
+        f"-i {iface} -p udp --dport 67:68 -j ACCEPT",
+        f"-i {iface} -p udp --dport 53 -j ACCEPT",
+        f"-i {iface} -p tcp --dport 53 -j ACCEPT",
+        f"-i {iface} -p tcp --dport 80 -j ACCEPT",
+        f"-i {iface} -p tcp --dport 5000 -j ACCEPT",
+        f"-i {iface} -m set --match-set {IPSET_TRUSTED_NAME} src -j ACCEPT",
+        f"-i {iface} -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT",
+    ]
+    if STRICT_MODE:
+        input_rules.append(f"-i {iface} -j DROP")
+    _restore("filter", "NIGEL_INPUT", input_rules)
+
+    forward_rules = [
+        "-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN",
+        f"-i {iface} -m set --match-set {IPSET_TRUSTED_NAME} src -j RETURN",
+        f"-i {iface} -m set --match-set {IPSET_MAC_NAME} src -j RETURN",
+    ]
+    if STRICT_MODE:
+        forward_rules.append(f"-i {iface} -j DROP")
+    _restore("filter", "NIGEL_FWD", forward_rules)
+
+    if _chain_exists("filter", "DOCKER-USER"):
+        docker_rules = [
+            f"-i {iface} -m set --match-set {IPSET_TRUSTED_NAME} src -j RETURN",
+            f"-i {iface} -m set --match-set {IPSET_MAC_NAME} src -j RETURN",
+        ]
+        if STRICT_MODE:
+            docker_rules.append(f"-i {iface} -j DROP")
+        _restore("filter", "NIGEL_DOCKER_USER", docker_rules)
+
+    wan = _default_route_iface()
+    if wan and wan != iface and not _rule_exists("nat", "POSTROUTING", "-o", wan, "-j", "MASQUERADE"):
+        _iptables("nat", "-A", "POSTROUTING", "-o", wan, "-j", "MASQUERADE", check=True)
+        run_cmd(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True)
+    logger.info("Nigel firewall chains applied for %s (strict=%s, wan=%s)", iface, STRICT_MODE, wan or "none")
+
 
 def apply_iptables_rules():
-    """
-    Set up iptables to allow authenticated devices while redirecting
-    unauthenticated traffic to the captive portal.
-    """
     init_ipset()
+    _configure_chains()
+    start_watchdog()
 
-    # Enable IP forwarding in the kernel for internet routing
-    run_cmd("sudo sysctl -w net.ipv4.ip_forward=1")
 
-    # 1. DNS queries (Port 53) are always allowed
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p udp --dport 53 -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 1 -i {WIFI_IFACE} -p udp --dport 53 -j ACCEPT")
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp --dport 53 -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 2 -i {WIFI_IFACE} -p tcp --dport 53 -j ACCEPT")
+def cleanup():
+    for table, chain, parent in CHAINS:
+        if _chain_exists(table, chain):
+            while _rule_exists(table, parent, "-j", chain):
+                _iptables(table, "-D", parent, "-j", chain)
+            _iptables(table, "-F", chain)
+            _iptables(table, "-X", chain)
+    run_cmd(["ipset", "destroy", IPSET_MAC_NAME])
+    run_cmd(["ipset", "destroy", IPSET_TRUSTED_NAME])
+    logger.info("Nigel firewall chains and ipsets removed")
 
-    # 2. Port 5000 direct access
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp --dport 5000 -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 3 -i {WIFI_IFACE} -p tcp --dport 5000 -j ACCEPT")
 
-    # 3. Always redirect local port 80 traffic (destined for 10.0.0.1) to port 5000 so OS probes reach Flask
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp -d 10.0.0.1 --dport 80 -j REDIRECT --to-port 5000 2>/dev/null || sudo iptables -t nat -I PREROUTING 4 -i {WIFI_IFACE} -p tcp -d 10.0.0.1 --dport 80 -j REDIRECT --to-port 5000")
+def _watchdog():
+    while True:
+        time.sleep(30)
+        if not _chain_exists("filter", "NIGEL_INPUT"):
+            logger.warning("Nigel firewall was missing; repairing it")
+            try:
+                apply_iptables_rules()
+            except Exception:
+                logger.exception("Firewall repair failed")
 
-    # 4. For authenticated MACs & IPs: allow all external traffic
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 5 -i {WIFI_IFACE} -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT")
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -m set --match-set {IPSET_IP_NAME} src -j ACCEPT 2>/dev/null || sudo iptables -t nat -I PREROUTING 6 -i {WIFI_IFACE} -m set --match-set {IPSET_IP_NAME} src -j ACCEPT")
 
-    # 5. Redirect unauthenticated external HTTP (Port 80) to captive portal
-    run_cmd(f"sudo iptables -t nat -C PREROUTING -i {WIFI_IFACE} -p tcp --dport 80 -j REDIRECT --to-port 5000 2>/dev/null || sudo iptables -t nat -A PREROUTING -i {WIFI_IFACE} -p tcp --dport 80 -j REDIRECT --to-port 5000")
+def start_watchdog():
+    global _watchdog_started
+    if not _watchdog_started:
+        _watchdog_started = True
+        threading.Thread(target=_watchdog, name="nigel-firewall-watchdog", daemon=True).start()
 
-    # 5. FORWARD rules: Allow authenticated devices to forward packets through router to WAN
-    run_cmd(f"sudo iptables -C FORWARD -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 1 -m set --match-set {IPSET_MAC_NAME} src -j ACCEPT")
-    run_cmd(f"sudo iptables -C FORWARD -m set --match-set {IPSET_IP_NAME} src -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 2 -m set --match-set {IPSET_IP_NAME} src -j ACCEPT")
-    run_cmd(f"sudo iptables -C FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || sudo iptables -I FORWARD 3 -m state --state RELATED,ESTABLISHED -j ACCEPT")
-
-    # 6. MASQUERADE outgoing traffic to WAN interfaces (non-wlan)
-    run_cmd(f"sudo iptables -t nat -C POSTROUTING -o ! {WIFI_IFACE} -j MASQUERADE 2>/dev/null || sudo iptables -t nat -A POSTROUTING -o ! {WIFI_IFACE} -j MASQUERADE")
 
 def restart_dnsmasq():
-    """Restart dnsmasq to apply any config changes."""
-    run_cmd("sudo systemctl restart dnsmasq")
-
+    run_cmd(["systemctl", "restart", "dnsmasq"], check=True)

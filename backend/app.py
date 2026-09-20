@@ -1,18 +1,44 @@
-from flask import Flask, request, redirect
+import argparse
+import logging
+import os
+import secrets
+import threading
+import time
+from datetime import datetime, time as clock_time
+from pathlib import Path
+from sqlalchemy import inspect, text
+from urllib.parse import urlparse
+
+from flask import Flask, request, redirect, jsonify
+from flask_login import current_user
 from extensions import db, socketio, login_manager, bcrypt
 import network
 
 def create_app(config_object=None):
     app = Flask(__name__, static_folder='../frontend/dist', static_url_path='/')
-    app.config['SECRET_KEY'] = 'dev-secret-key-change-in-prod'
+    state_dir = Path(os.environ.get('NIGEL_STATE_DIR', '/var/lib/nigel-server'))
+    state_dir.mkdir(parents=True, exist_ok=True)
+    secret_path = Path(os.environ.get('NIGEL_SECRET_KEY_FILE', state_dir / 'secret.key'))
+    if secret_path.exists():
+        secret_key = secret_path.read_text(encoding='ascii').strip()
+    else:
+        secret_key = secrets.token_urlsafe(48)
+        secret_path.write_text(secret_key + '\n', encoding='ascii')
+        secret_path.chmod(0o600)
+    app.config['SECRET_KEY'] = secret_key
+    app.config['PORTAL_ORIGIN'] = os.environ.get('PORTAL_ORIGIN', 'http://localhost:5000').rstrip('/')
+    portal_host = urlparse(app.config['PORTAL_ORIGIN']).hostname
+    app.config['PORTAL_HOSTS'] = {host for host in (portal_host, 'localhost', '127.0.0.1') if host}
     app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///nigel.db'
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    app.config['SESSION_COOKIE_HTTPONLY'] = True
+    app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
     if config_object:
         app.config.from_object(config_object)
 
     db.init_app(app)
-    socketio.init_app(app)
+    socketio.init_app(app, cors_allowed_origins=app.config['PORTAL_ORIGIN'])
     login_manager.init_app(app)
     bcrypt.init_app(app)
 
@@ -28,21 +54,16 @@ def create_app(config_object=None):
             request.path in ('/favicon.ico', '/favicon.jpg', '/favicon.svg', '/icons.svg')):
             return None
 
-        from models import Device
+        from models import Device, TrustedDevice
         client_ip = request.remote_addr
         mac_address = network.get_mac_from_ip(client_ip)
 
-        # Check if device is authenticated
-        is_auth = False
-        if mac_address and not mac_address.startswith('ip-'):
-            dev = Device.query.filter_by(mac_address=mac_address).first()
-            if dev and dev.is_authenticated:
-                is_auth = True
-        if not is_auth and client_ip:
-            dev = Device.query.filter_by(ip_address=client_ip).first()
-            if dev and dev.is_authenticated:
-                is_auth = True
-
+        # Check server-derived device identity and reject blocked devices.
+        current_device = Device.query.filter_by(mac_address=mac_address).first() if mac_address else None
+        trusted = TrustedDevice.query.filter_by(mac_address=mac_address).first() if mac_address else None
+        is_auth = bool(trusted or (current_device and current_device.is_authenticated and not current_device.is_blocked))
+        if current_user.is_authenticated and (not current_device or not current_device.is_blocked):
+            is_auth = True
         # Handle OS Captive Portal Connectivity Probes
         path = request.path.lower()
         host = (request.host or '').lower()
@@ -51,7 +72,7 @@ def create_app(config_object=None):
         if path in ('/generate_204', '/gen_204') or 'connectivitycheck.gstatic.com' in host:
             if is_auth:
                 return ('', 204)
-            return redirect('http://10.0.0.1:5000/', code=302)
+            return redirect(f"{app.config['PORTAL_ORIGIN']}/", code=302)
 
         # 2. Apple iOS / macOS CNA probe (turns the "X" into "Done" / Blue Checkmark)
         if ('hotspot-detect.html' in path or 
@@ -63,22 +84,22 @@ def create_app(config_object=None):
             'airport.us' in host):
             if is_auth:
                 return ('<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>', 200, {'Content-Type': 'text/html'})
-            return redirect('http://10.0.0.1:5000/', code=302)
+            return redirect(f"{app.config['PORTAL_ORIGIN']}/", code=302)
 
         # 3. Windows NCSI probe (clears "Action Needed" on Windows)
         if 'connecttest.txt' in path or 'msftconnecttest.com' in host:
             if is_auth:
                 return ('Microsoft Connect Test', 200, {'Content-Type': 'text/plain'})
-            return redirect('http://10.0.0.1:5000/', code=302)
+            return redirect(f"{app.config['PORTAL_ORIGIN']}/", code=302)
 
         if 'ncsi.txt' in path or 'msftncsi.com' in host:
             if is_auth:
                 return ('Microsoft NCSI', 200, {'Content-Type': 'text/plain'})
-            return redirect('http://10.0.0.1:5000/', code=302)
+            return redirect(f"{app.config['PORTAL_ORIGIN']}/", code=302)
 
         # Allow direct access to server IPs and hostnames
         host_without_port = request.host.split(':')[0]
-        if host_without_port in ('10.0.0.1', '192.168.4.1', 'localhost', '127.0.0.1', 'nigel.local'):
+        if host_without_port in app.config['PORTAL_HOSTS'] or host_without_port == 'nigel.local':
             return None
 
         # If authenticated, do NOT redirect foreign requests (handled by iptables)
@@ -86,7 +107,7 @@ def create_app(config_object=None):
             return None
 
         # If unauthenticated and accessing external domain, redirect to captive portal
-        return redirect('http://10.0.0.1:5000/', code=302)
+        return redirect(f"{app.config['PORTAL_ORIGIN']}/", code=302)
 
     @app.route('/', defaults={'path': ''})
     @app.route('/<path:path>')
@@ -96,38 +117,118 @@ def create_app(config_object=None):
 
     return app
 
-if __name__ == '__main__':
-    app = create_app()
+
+def expire_access_loop(app):
+    from models import AuditLog, Device, Voucher
+    while True:
+        time.sleep(30)
+        with app.app_context():
+            now = datetime.utcnow()
+            cutoff = now - __import__('datetime').timedelta(days=30)
+            AuditLog.query.filter(AuditLog.timestamp < cutoff).delete(synchronize_session=False)
+            expired = Voucher.query.filter(
+                Voucher.expires_at.isnot(None), Voucher.expires_at <= now,
+                Voucher.used_by_device.isnot(None)
+            ).all()
+            changed = False
+            devices = Device.query.filter_by(is_authenticated=True, is_blocked=False).all()
+            for voucher in expired:
+                device = Device.query.filter_by(mac_address=voucher.used_by_device).first()
+                if device and device.is_authenticated:
+                    device.is_authenticated = False
+                    network.remove_device_from_ipset(mac_address=device.mac_address)
+                    changed = True
+            for device in devices:
+                if device.access_expires_at and device.access_expires_at <= now:
+                    device.is_authenticated = False
+                    network.remove_device_from_ipset(mac_address=device.mac_address)
+                    changed = True
+                    continue
+                user = device.user
+                if not user:
+                    continue
+                if user.quota_mb is not None and device.data_used_mb >= user.quota_mb:
+                    device.is_authenticated = False
+                    network.remove_device_from_ipset(mac_address=device.mac_address)
+                    changed = True
+                    continue
+                if user.time_window_start and user.time_window_end:
+                    current = datetime.utcnow().time()
+                    start = clock_time.fromisoformat(user.time_window_start)
+                    end = clock_time.fromisoformat(user.time_window_end)
+                    in_window = start <= current <= end if start <= end else current >= start or current <= end
+                    if not in_window:
+                        device.is_authenticated = False
+                        network.remove_device_from_ipset(mac_address=device.mac_address)
+                        changed = True
+            if changed:
+                db.session.commit()
+                logging.getLogger(__name__).info('Expired voucher access removed')
+            else:
+                db.session.commit()
+
+
+def start_expiry_worker(app):
+    worker = threading.Thread(target=expire_access_loop, args=(app,), name='nigel-expiry', daemon=True)
+    worker.start()
+
+
+def initialize_database(app):
     with app.app_context():
         db.create_all()
-        
-        from models import RegisteredService, User, Device
-        # Seed default admin if no users exist
+        from models import RegisteredService, User, Device, TrustedDevice
+        columns = {column['name'] for column in inspect(db.engine).get_columns('device')}
+        if 'access_expires_at' not in columns:
+            db.session.execute(text('ALTER TABLE device ADD COLUMN access_expires_at DATETIME'))
+            db.session.commit()
         if User.query.count() == 0:
-            admin = User(username='admin', role='admin', is_approved=True)
-            admin.set_password('admin')
+            password = secrets.token_urlsafe(18)
+            admin = User(username='admin', role='admin', is_approved=True, must_change_password=True)
+            admin.set_password(password)
             db.session.add(admin)
             db.session.commit()
+            logging.getLogger(__name__).warning('Initial admin password: %s', password)
+            password_file = Path(os.environ.get('NIGEL_ADMIN_PASSWORD_FILE', '/var/lib/nigel-server/admin-password'))
+            password_file.parent.mkdir(parents=True, exist_ok=True)
+            password_file.write_text(password + '\n', encoding='ascii')
+            password_file.chmod(0o600)
 
-        # Seed default services if none exist
-        if RegisteredService.query.count() == 0:
-            defaults = [
-                RegisteredService(name="Samba Share", description="Local file server", url="smb://10.0.0.1/share", icon="folder", check_port=445),
-                RegisteredService(name="MiniDLNA", description="Media streaming", url="http://10.0.0.1:8200", icon="film", check_port=8200),
-                RegisteredService(name="qBittorrent", description="Download manager", url="http://10.0.0.1:8080", icon="download", check_port=8080),
-                RegisteredService(name="Plex", description="Media server", url="http://10.0.0.1:32400/web", icon="film", check_port=32400),
-                RegisteredService(name="Jellyfin", description="Media server", url="http://10.0.0.1:8096", icon="film", check_port=8096)
+        service_host = urlparse(app.config['PORTAL_ORIGIN']).hostname or 'localhost'
+        default_services = [
+                RegisteredService(name='SSH', description='Secure shell administration', url=f'ssh://{service_host}:22', icon='terminal', check_port=22),
+                RegisteredService(name='Samba Share', description='Local file server', url=f'smb://{service_host}/share', icon='folder', check_port=445),
+                RegisteredService(name='File Browser', description='Web file manager', url=f'http://{service_host}:80', icon='folder', check_port=80),
+                RegisteredService(name='MiniDLNA', description='Media streaming', url=f'http://{service_host}:8200', icon='film', check_port=8200),
+                RegisteredService(name='qBittorrent', description='Download manager', url=f'http://{service_host}:8080', icon='download', check_port=8080),
+                RegisteredService(name='Homepage', description='Docker service dashboard', url=f'http://{service_host}:3002', icon='home', check_port=3002),
+                RegisteredService(name='Uptime Kuma', description='Service monitoring', url=f'http://{service_host}:3003', icon='activity', check_port=3003),
+                RegisteredService(name='Netdata', description='System monitoring', url=f'http://{service_host}:19999', icon='chart', check_port=19999),
+                RegisteredService(name='Inaetia Studio', description='Node application', url=f'http://{service_host}:3000', icon='code', check_port=3000),
+                RegisteredService(name='Node App', description='Node application', url=f'http://{service_host}:3001', icon='code', check_port=3001),
+                RegisteredService(name='Plex', description='Media server', url=f'http://{service_host}:32400/web', icon='film', check_port=32400),
+                RegisteredService(name='Jellyfin', description='Media server', url=f'http://{service_host}:8096', icon='film', check_port=8096),
             ]
-            db.session.bulk_save_objects(defaults)
+        existing_services = {service.name for service in RegisteredService.query.all()}
+        missing_services = [service for service in default_services if service.name not in existing_services]
+        if missing_services:
+            db.session.bulk_save_objects(missing_services)
             db.session.commit()
-            
-        # Apply iptables rules
-        network.apply_iptables_rules()
 
-        # Restore previously authenticated devices from database into firewall
-        auth_devices = Device.query.filter_by(is_authenticated=True).all()
-        for d in auth_devices:
-            network.add_device_to_ipset(mac_address=d.mac_address, ip_address=d.ip_address)
-            
-    socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
+        network.apply_iptables_rules()
+        for device in Device.query.filter_by(is_authenticated=True, is_blocked=False).all():
+            network.add_device_to_ipset(mac_address=device.mac_address)
+        for trusted in TrustedDevice.query.all():
+            network.add_trusted_device(trusted.mac_address)
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--cleanup', action='store_true', help='Remove Nigel firewall chains and ipsets')
+    args = parser.parse_args()
+    app = create_app()
+    if args.cleanup:
+        network.cleanup()
+    else:
+        initialize_database(app)
+        start_expiry_worker(app)
+        socketio.run(app, host='0.0.0.0', port=5000, allow_unsafe_werkzeug=True)
 

@@ -1,6 +1,7 @@
 import os
 import requests
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -38,3 +39,8 @@ def notify_all(message):
     """Send notification to all configured integrations."""
     send_telegram_notification(message)
     send_discord_notification(message)
+
+
+def notify_all_async(message):
+    """Deliver notifications outside the request path; integration failures are isolated."""
+    threading.Thread(target=notify_all, args=(message,), name='nigel-notify', daemon=True).start()

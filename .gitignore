@@ -1,0 +1,11 @@
+backend/instance/
+backend/__pycache__/
+**/__pycache__/
+venv/
+frontend/node_modules/
+frontend/dist/
+.pytest_cache/
+*.pyc
+
+# A second local checkout is not part of this repository.
+nigel-server-captive-portal/

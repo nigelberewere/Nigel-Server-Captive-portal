@@ -1,13 +1,15 @@
 [Unit]
 Description=Nigel Server Captive Portal Backend
-After=network.target
+After=network-online.target hostapd.service dnsmasq.service
+Wants=network-online.target
 
 [Service]
 User=root
 WorkingDirectory=/opt/nigel-server/backend
-Environment="PATH=/opt/nigel-server/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=/opt/nigel-server/venv/bin/python app.py
-Restart=always
+EnvironmentFile=/etc/nigel/nigel.env
+Restart=on-failure
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

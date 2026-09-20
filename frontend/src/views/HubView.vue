@@ -26,6 +26,10 @@
         <p class="text-sm text-muted mt-2">{{ svc.description }}</p>
       </div>
     </div>
+    <div class="mt-8 flex gap-4">
+      <router-link to="/about" class="btn btn-secondary">About & Rules</router-link>
+      <a href="/api/wifi/qr" class="btn btn-secondary" target="_blank" rel="noopener">Wi-Fi QR</a>
+    </div>
   </div>
 </template>
 
@@ -61,11 +65,10 @@ function goTo(url) {
 async function logout() {
   try {
     const urlParams = new URLSearchParams(window.location.search);
-    const mac_address = urlParams.get('mac') || '';
     await fetch('/api/auth/logout', { 
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mac_address })
+      body: JSON.stringify({})
     })
   } catch (err) {}
   router.push('/login')

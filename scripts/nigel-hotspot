@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE=/etc/nigel/nigel.env
+[[ -r $ENV_FILE ]] || { echo "Missing $ENV_FILE; run setup.sh enable-hotspot first" >&2; exit 1; }
+. "$ENV_FILE"
+: "${WIFI_IFACE:?WIFI_IFACE is missing}"
+: "${NIGEL_WIFI_IP:?NIGEL_WIFI_IP is missing}"
+: "${NIGEL_WIFI_PREFIX:?NIGEL_WIFI_PREFIX is missing}"
+: "${NIGEL_ROOT:?NIGEL_ROOT is missing}"
+: "${NIGEL_STATE_DIR:?NIGEL_STATE_DIR is missing}"
+DNSMASQ_CONF="$NIGEL_STATE_DIR/dnsmasq.conf"
+
+require_root() { [[ $EUID -eq 0 ]] || { echo 'Run as root.' >&2; exit 1; }; }
+
+wait_for_type() {
+  local expected=$1 current
+  for _ in {1..50}; do
+    current=$(iw dev "$WIFI_IFACE" info 2>/dev/null | awk '$1 == "type" {print $2; exit}')
+    [[ "$current" == "$expected" ]] && return 0
+    sleep 0.2
+  done
+  echo "Timed out waiting for $WIFI_IFACE type $expected (current: ${current:-unknown})" >&2
+  return 1
+}
+
+wait_for_address() {
+  for _ in {1..50}; do
+    ip -4 -o addr show dev "$WIFI_IFACE" | awk '{print $4}' | grep -Fxq "$NIGEL_WIFI_IP/$NIGEL_WIFI_PREFIX" && return 0
+    sleep 0.2
+  done
+  echo "Timed out waiting for $NIGEL_WIFI_IP/$NIGEL_WIFI_PREFIX on $WIFI_IFACE" >&2
+  return 1
+}
+
+stop_hotspot_services() {
+  systemctl stop nigel-server.service dnsmasq.service hostapd.service 2>/dev/null || true
+}
+
+stop_client_daemons() {
+  systemctl stop "wpa_supplicant@$WIFI_IFACE.service" 2>/dev/null || true
+  systemctl stop wpa_supplicant.service 2>/dev/null || true
+  pkill -x wpa_supplicant 2>/dev/null || true
+}
+
+cleanup_firewall() {
+  "$NIGEL_ROOT/venv/bin/python" "$NIGEL_ROOT/backend/app.py" --cleanup 2>/dev/null || true
+}
+
+set_client_managed() {
+  ip addr flush dev "$WIFI_IFACE"
+  ip link set dev "$WIFI_IFACE" down
+  iw dev "$WIFI_IFACE" set type managed
+  wait_for_type managed
+  ip link set dev "$WIFI_IFACE" up
+}
+
+start_client_mode() {
+  stop_hotspot_services
+  stop_client_daemons
+  cleanup_firewall
+  if systemctl is-active --quiet NetworkManager; then
+    nmcli device set "$WIFI_IFACE" managed no 2>/dev/null || true
+  elif systemctl is-active --quiet systemd-networkd; then
+    systemctl stop systemd-networkd.service 2>/dev/null || true
+    networkctl down "$WIFI_IFACE" 2>/dev/null || true
+  fi
+  set_client_managed
+  [[ -r /etc/wpa_supplicant.conf ]] || { echo 'Missing /etc/wpa_supplicant.conf; cannot restore client mode' >&2; return 1; }
+  wpa_supplicant -B -i "$WIFI_IFACE" -c /etc/wpa_supplicant.conf
+  timeout 45 dhclient -1 -q "$WIFI_IFACE"
+  ip -4 -o addr show dev "$WIFI_IFACE" | grep -q . || { echo 'dhclient did not assign a client address' >&2; return 1; }
+}
+
+rollback_client() {
+  echo 'Hotspot startup failed; rolling back to client mode.' >&2
+  set +e
+  start_client_mode
+  local result=$?
+  set -e
+  if (( result != 0 )); then
+    echo 'Client-mode rollback failed; the local console remains available for repair.' >&2
+  fi
+  return 1
+}
+
+concurrency_report() {
+  local combinations
+  combinations=$(iw list 2>/dev/null | awk '/valid interface combinations:/,/Supported commands:/')
+  if grep -Eq '\{ managed \}.*\{ AP \}|\{ AP \}.*\{ managed \}' <<<"$combinations"; then
+    echo 'AP+STA concurrency: advertised by the Wi-Fi card'
+  else
+    echo 'AP+STA concurrency: not advertised; use nigel-hotspot on/off mode'
+  fi
+  printf '%s\n' "$combinations" | grep -E 'valid interface combinations|managed|AP' || true
+}
+
+ap_on() {
+  require_root
+  concurrency_report
+  stop_hotspot_services
+  stop_client_daemons
+  if systemctl is-active --quiet NetworkManager; then
+    nmcli device disconnect "$WIFI_IFACE" 2>/dev/null || true
+    nmcli device set "$WIFI_IFACE" managed no 2>/dev/null || true
+  elif systemctl is-active --quiet systemd-networkd; then
+    systemctl stop systemd-networkd.service 2>/dev/null || true
+    networkctl down "$WIFI_IFACE" 2>/dev/null || true
+  fi
+  ip addr flush dev "$WIFI_IFACE"
+  ip link set dev "$WIFI_IFACE" down
+  iw dev "$WIFI_IFACE" set type __ap
+  wait_for_type AP || rollback_client
+  ip addr add "$NIGEL_WIFI_IP/$NIGEL_WIFI_PREFIX" dev "$WIFI_IFACE"
+  ip link set dev "$WIFI_IFACE" up
+  wait_for_address || rollback_client
+  dnsmasq --test --conf-file="$DNSMASQ_CONF" --conf-dir= || rollback_client
+  if ! systemctl start hostapd.service; then
+    journalctl -u hostapd.service -n 50 --no-pager || true
+    rollback_client
+  fi
+  wait_for_type AP || rollback_client
+  if ! systemctl start dnsmasq.service; then
+    journalctl -u dnsmasq.service -n 50 --no-pager || true
+    rollback_client
+  fi
+  if ! systemctl start nigel-server.service; then
+    journalctl -u nigel-server.service -n 50 --no-pager || true
+    rollback_client
+  fi
+  systemctl enable nigel-hotspot.service 2>/dev/null || true
+  echo "Hotspot is on: $WIFI_IFACE $NIGEL_WIFI_IP/$NIGEL_WIFI_PREFIX"
+}
+
+ap_off() {
+  require_root
+  if start_client_mode; then
+    if [[ "${NIGEL_HOTSPOT_UNIT:-0}" != 1 ]]; then
+      systemctl disable nigel-hotspot.service 2>/dev/null || true
+    fi
+    echo "Hotspot is off; $WIFI_IFACE returned to client mode."
+  else
+    echo "Hotspot is off, but client mode could not be verified." >&2
+    return 1
+  fi
+}
+
+status() {
+  concurrency_report
+  ip -brief addr show dev "$WIFI_IFACE" || true
+  iw dev "$WIFI_IFACE" info || true
+  iw dev "$WIFI_IFACE" link || true
+  systemctl --no-pager --full status hostapd dnsmasq nigel-server 2>/dev/null || true
+}
+
+case "${1:-status}" in
+  on) ap_on ;;
+  off) ap_off ;;
+  status) status ;;
+  *) echo 'Usage: nigel-hotspot on|off|status' >&2; exit 2 ;;
+esac

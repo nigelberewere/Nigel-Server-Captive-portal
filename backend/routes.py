@@ -1,9 +1,62 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_file
+import logging
+import os
 from flask_login import login_user, logout_user, login_required, current_user
-from models import User, Device, Voucher, Setting, RegisteredService
+from models import AuditLog, User, Device, Voucher, Setting, RegisteredService, PasswordResetToken, TrustedDevice
 from extensions import db, socketio
 import network
 import datetime
+import secrets
+import string
+import threading
+import time
+import re
+import io
+import qrcode
+import hashlib
+from notify import notify_all_async
+
+_rate_limit = {}
+_rate_lock = threading.Lock()
+MAC_RE = re.compile(r'^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$', re.IGNORECASE)
+
+
+def _client_mac():
+    return network.get_mac_from_ip(request.remote_addr)
+
+
+def _throttled(action, limit, window=60):
+    key = (action, request.remote_addr or 'unknown')
+    now = time.monotonic()
+    with _rate_lock:
+        attempts = [stamp for stamp in _rate_limit.get(key, []) if now - stamp < window]
+        if len(attempts) >= limit:
+            _rate_limit[key] = attempts
+            return True
+        attempts.append(now)
+        _rate_limit[key] = attempts
+    return False
+
+
+def _device_for_mac(mac_address):
+    return Device.query.filter_by(mac_address=mac_address).first()
+
+
+def _admin_mac(mac_address):
+    if not isinstance(mac_address, str) or not MAC_RE.fullmatch(mac_address):
+        return None
+    return mac_address.lower()
+
+
+def _audit(action, details='', user_id=None):
+    db.session.add(AuditLog(action=action, details=details, user_id=user_id))
+
+
+def _notify_device(action, mac_address, username=None):
+    subject = f'Device {action}: {mac_address}'
+    if username:
+        subject += f' ({username})'
+    notify_all_async(subject)
 
 api_bp = Blueprint('api', __name__)
 
@@ -28,13 +81,18 @@ def notify_vouchers_changed():
 @api_bp.route('/auth/status', methods=['GET'])
 def auth_status():
     client_ip = request.remote_addr
-    mac_address = network.get_mac_from_ip(client_ip) or f"ip-{client_ip}"
+    mac_address = _client_mac()
     
     is_auth = False
     role = 'guest'
     username = None
     
-    if current_user.is_authenticated:
+    trusted = TrustedDevice.query.filter_by(mac_address=mac_address).first() if mac_address else None
+    if trusted:
+        is_auth = True
+        role = 'trusted'
+        username = trusted.label or 'Trusted device'
+    elif current_user.is_authenticated:
         is_auth = True
         role = current_user.role
         username = current_user.username
@@ -42,10 +100,7 @@ def auth_status():
         dev = None
         if mac_address and not mac_address.startswith('ip-'):
             dev = Device.query.filter_by(mac_address=mac_address).first()
-        if not dev and client_ip:
-            dev = Device.query.filter_by(ip_address=client_ip).first()
-            
-        if dev and dev.is_authenticated:
+        if dev and dev.is_authenticated and not dev.is_blocked:
             is_auth = True
             if dev.user:
                 role = dev.user.role
@@ -63,13 +118,15 @@ def auth_status():
 
 @api_bp.route('/auth/register', methods=['POST'])
 def register():
+    if _throttled('register', 5):
+        return jsonify({'message': 'Too many registration attempts'}), 429
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip()
     password = data.get('password')
     client_ip = request.remote_addr
-    mac_address = data.get('mac_address') or network.get_mac_from_ip(client_ip) or f"ip-{client_ip}"
+    mac_address = _client_mac()
     
-    if not username or not password:
+    if not username or not password or not mac_address:
         return jsonify({'message': 'Please provide both username and password'}), 400
         
     if User.query.filter_by(username=username).first():
@@ -85,9 +142,7 @@ def register():
     device = None
     if mac_address and not mac_address.startswith('ip-'):
         device = Device.query.filter_by(mac_address=mac_address).first()
-    if not device and client_ip:
-        device = Device.query.filter_by(ip_address=client_ip).first()
-        
+
     if not device:
         device = Device(mac_address=mac_address, ip_address=client_ip, user_id=new_user.id, is_authenticated=False)
         db.session.add(device)
@@ -96,32 +151,42 @@ def register():
         device.is_authenticated = False
 
     db.session.commit()
+    _audit('register', f'username={username}; mac={mac_address}')
+    db.session.commit()
     notify_users_changed()
     return jsonify({'message': 'Account requested! Waiting for admin approval.'}), 201
 
 @api_bp.route('/auth/login', methods=['POST'])
 def login():
+    if _throttled('login', 10):
+        return jsonify({'message': 'Too many login attempts'}), 429
     data = request.get_json(silent=True) or {}
     username = (data.get('username') or '').strip()
     password = data.get('password')
     client_ip = request.remote_addr
-    mac_address = data.get('mac_address') or network.get_mac_from_ip(client_ip) or f"ip-{client_ip}"
+    mac_address = _client_mac()
     
     user = User.query.filter_by(username=username).first()
     if user and user.check_password(password):
         # Admin is always approved, check is_approved for normal users
         if user.role != 'admin' and not user.is_approved:
             return jsonify({'message': 'Account pending admin approval.'}), 403
-            
+        if not mac_address:
+            return jsonify({'message': 'Could not identify this device'}), 400
+        existing_device = Device.query.filter_by(mac_address=mac_address).first()
+        if existing_device and existing_device.is_blocked:
+            return jsonify({'message': 'This device is blocked'}), 403
+        if user.role == 'admin' and user.must_change_password:
+            login_user(user)
+            return jsonify({'message': 'Password change required', 'must_change_password': True}), 200
+
         login_user(user)
-        
+
         # Authenticate the device
         device = None
         if mac_address and not mac_address.startswith('ip-'):
             device = Device.query.filter_by(mac_address=mac_address).first()
-        if not device and client_ip:
-            device = Device.query.filter_by(ip_address=client_ip).first()
-            
+
         if not device:
             device = Device(mac_address=mac_address, ip_address=client_ip)
             db.session.add(device)
@@ -131,30 +196,85 @@ def login():
             
         device.user_id = user.id
         device.is_authenticated = True
+        device.access_expires_at = None
         device.connected_at = datetime.datetime.utcnow()
         device.last_seen = datetime.datetime.utcnow()
         db.session.commit()
+        _audit('login', f'mac={mac_address}', user.id)
+        db.session.commit()
+        _notify_device('authenticated', mac_address, user.username)
         
         # Whitelist device in firewall (both MAC and IP)
         network.add_device_to_ipset(mac_address=mac_address, ip_address=client_ip)
         notify_devices_changed()
             
-        return jsonify({'message': 'Logged in successfully', 'role': user.role, 'mac_address': mac_address}), 200
+        return jsonify({'message': 'Logged in successfully', 'role': user.role}), 200
         
     return jsonify({'message': 'Invalid credentials'}), 401
 
+@api_bp.route('/auth/password', methods=['POST'])
+@login_required
+def change_password():
+    data = request.get_json(silent=True) or {}
+    password = data.get('password')
+    if not isinstance(password, str) or len(password) < 12:
+        return jsonify({'message': 'Password must be at least 12 characters'}), 400
+    current_user.set_password(password)
+    current_user.must_change_password = False
+    db.session.commit()
+    return jsonify({'message': 'Password changed'}), 200
+
+
+@api_bp.route('/auth/password-reset', methods=['POST'])
+def request_password_reset():
+    if _throttled('password-reset', 3):
+        return jsonify({'message': 'Too many reset requests'}), 429
+    data = request.get_json(silent=True) or {}
+    username = (data.get('username') or '').strip()
+    user = User.query.filter_by(username=username).first()
+    response = {'message': 'If that account exists, reset instructions were created'}
+    if not user:
+        return jsonify(response), 200
+    raw_token = secrets.token_urlsafe(32)
+    db.session.add(PasswordResetToken(
+        user_id=user.id,
+        token_hash=hashlib.sha256(raw_token.encode('utf-8')).hexdigest(),
+        expires_at=datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    ))
+    db.session.commit()
+    logging.getLogger(__name__).warning('Password reset token for %s: %s', username, raw_token)
+    return jsonify(response), 200
+
+
+@api_bp.route('/auth/password-reset/confirm', methods=['POST'])
+def confirm_password_reset():
+    data = request.get_json(silent=True) or {}
+    token = data.get('token')
+    password = data.get('password')
+    if not isinstance(token, str) or not isinstance(password, str) or len(password) < 12:
+        return jsonify({'message': 'Token and a 12-character password are required'}), 400
+    token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    reset = PasswordResetToken.query.filter_by(token_hash=token_hash, used_at=None).first()
+    if not reset or reset.expires_at <= datetime.datetime.utcnow():
+        return jsonify({'message': 'Invalid or expired reset token'}), 400
+    reset.user.set_password(password)
+    reset.user.must_change_password = False
+    reset.used_at = datetime.datetime.utcnow()
+    db.session.commit()
+    return jsonify({'message': 'Password reset'}), 200
+
 @api_bp.route('/auth/logout', methods=['POST'])
 def logout():
-    data = request.get_json(silent=True) or {}
-    client_ip = request.remote_addr
-    mac_address = data.get('mac_address') or network.get_mac_from_ip(client_ip)
+    mac_address = _client_mac()
     
     if mac_address:
         device = Device.query.filter_by(mac_address=mac_address).first()
         if device:
             device.is_authenticated = False
+            _audit('logout', f'mac={mac_address}', device.user_id)
             db.session.commit()
             network.remove_device_from_ipset(mac_address=mac_address, ip_address=device.ip_address)
+            _notify_device('disconnected', mac_address)
             notify_devices_changed()
             
     if current_user.is_authenticated:
@@ -163,12 +283,14 @@ def logout():
 
 @api_bp.route('/auth/voucher', methods=['POST'])
 def use_voucher():
+    if _throttled('voucher', 10):
+        return jsonify({'message': 'Too many voucher attempts'}), 429
     data = request.get_json(silent=True) or {}
     code = (data.get('code') or '').strip().upper()
     client_ip = request.remote_addr
-    mac_address = data.get('mac_address') or network.get_mac_from_ip(client_ip) or f"ip-{client_ip}"
+    mac_address = _client_mac()
     
-    if not code:
+    if not code or not mac_address:
         return jsonify({'message': 'Please enter a voucher code'}), 400
         
     voucher = Voucher.query.filter_by(code=code).first()
@@ -194,9 +316,7 @@ def use_voucher():
     device = None
     if mac_address and not mac_address.startswith('ip-'):
         device = Device.query.filter_by(mac_address=mac_address).first()
-    if not device and client_ip:
-        device = Device.query.filter_by(ip_address=client_ip).first()
-        
+
     if not device:
         device = Device(mac_address=mac_address, ip_address=client_ip)
         db.session.add(device)
@@ -205,9 +325,13 @@ def use_voucher():
         device.ip_address = client_ip
         
     device.is_authenticated = True
+    device.access_expires_at = None
     device.connected_at = now
     device.last_seen = now
     db.session.commit()
+    _audit('voucher_auth', f'mac={mac_address}; voucher={voucher.code}', device.user_id)
+    db.session.commit()
+    _notify_device('authenticated by voucher', mac_address)
     
     # Instantly allow device traffic through firewall
     network.add_device_to_ipset(mac_address=mac_address, ip_address=client_ip)
@@ -219,6 +343,38 @@ def use_voucher():
         'mac_address': mac_address,
         'expires_at': voucher.expires_at.isoformat() if voucher.expires_at else None
     }), 200
+
+
+@api_bp.route('/auth/guest', methods=['POST'])
+def guest_access():
+    if _throttled('guest', 3):
+        return jsonify({'message': 'Too many guest requests'}), 429
+    mac_address = _client_mac()
+    if not mac_address:
+        return jsonify({'message': 'Could not identify this device'}), 400
+    data = request.get_json(silent=True) or {}
+    try:
+        duration = max(1, min(24, int(data.get('duration_hours', 2))))
+    except (TypeError, ValueError):
+        return jsonify({'message': 'Invalid duration'}), 400
+    now = datetime.datetime.utcnow()
+    device = Device.query.filter_by(mac_address=mac_address).first()
+    if device and device.is_blocked:
+        return jsonify({'message': 'This device is blocked'}), 403
+    if not device:
+        device = Device(mac_address=mac_address, ip_address=request.remote_addr)
+        db.session.add(device)
+    device.is_authenticated = True
+    device.access_expires_at = now + datetime.timedelta(hours=duration)
+    device.connected_at = now
+    device.last_seen = now
+    db.session.flush()
+    _audit('guest_access', f'mac={mac_address}; hours={duration}', device.user_id)
+    db.session.commit()
+    network.add_device_to_ipset(mac_address=mac_address)
+    _notify_device('granted guest access', mac_address)
+    notify_devices_changed()
+    return jsonify({'message': 'Guest access granted', 'expires_at': device.access_expires_at.isoformat()}), 200
 
 import subprocess
 
@@ -301,14 +457,87 @@ def get_devices():
     devices = Device.query.all()
     res = []
     for d in devices:
+        telemetry = network.get_device_telemetry(d.mac_address)
+        d.hostname = telemetry['hostname'] or d.hostname
+        d.data_used_mb = telemetry['data_used_mb']
         res.append({
             'mac_address': d.mac_address,
             'ip_address': d.ip_address,
             'hostname': d.hostname,
             'is_authenticated': d.is_authenticated,
+            'is_blocked': d.is_blocked,
+            'data_used_mb': d.data_used_mb,
+            'signal_strength': telemetry['signal_strength'],
             'user': d.user.username if d.user else ('Voucher' if d.is_authenticated else 'Unauthenticated')
         })
     return jsonify(res), 200
+
+
+@api_bp.route('/admin/trusted-devices', methods=['GET', 'POST'])
+@login_required
+def trusted_devices():
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        mac_address = _admin_mac(data.get('mac_address'))
+        if not mac_address:
+            return jsonify({'message': 'Invalid MAC address'}), 400
+        trusted = TrustedDevice.query.filter_by(mac_address=mac_address).first()
+        if not trusted:
+            trusted = TrustedDevice(mac_address=mac_address, label=(data.get('label') or '').strip() or None)
+            db.session.add(trusted)
+        else:
+            trusted.label = (data.get('label') or '').strip() or trusted.label
+        db.session.commit()
+        network.add_trusted_device(mac_address)
+        _audit('trusted_device_added', f'mac={mac_address}', current_user.id)
+        db.session.commit()
+        notify_devices_changed()
+        return jsonify({'message': 'Trusted device saved'}), 201
+    return jsonify([{'id': d.id, 'mac_address': d.mac_address, 'label': d.label} for d in TrustedDevice.query.order_by(TrustedDevice.created_at.desc()).all()]), 200
+
+
+@api_bp.route('/admin/trusted-devices/<path:mac_address>', methods=['DELETE'])
+@login_required
+def delete_trusted_device(mac_address):
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    mac_address = _admin_mac(mac_address)
+    if not mac_address:
+        return jsonify({'message': 'Invalid MAC address'}), 400
+    trusted = TrustedDevice.query.filter_by(mac_address=mac_address).first()
+    if trusted:
+        db.session.delete(trusted)
+        db.session.commit()
+    network.remove_trusted_device(mac_address)
+    return jsonify({'message': 'Trusted device removed'}), 200
+
+
+@api_bp.route('/admin/audit', methods=['GET'])
+@login_required
+def audit_logs():
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    logs = AuditLog.query.order_by(AuditLog.timestamp.desc()).limit(500).all()
+    return jsonify([{
+        'id': log.id, 'timestamp': log.timestamp.isoformat(), 'action': log.action,
+        'details': log.details, 'user_id': log.user_id
+    } for log in logs]), 200
+
+
+@api_bp.route('/wifi/qr', methods=['GET'])
+def wifi_qr():
+    ssid = os.environ.get('WIFI_SSID', 'Nigel Server')
+    passphrase = os.environ.get('WIFI_PASSPHRASE', '')
+    portal_url = os.environ.get('PORTAL_ORIGIN', 'http://localhost:5000')
+    security = 'WPA' if passphrase else 'nopass'
+    payload = f'SSID: {ssid}\nSecurity: {security}\nPassword: {passphrase or "(open network)"}\nPortal: {portal_url}'
+    image = qrcode.make(payload)
+    output = io.BytesIO()
+    image.save(output, format='PNG')
+    output.seek(0)
+    return send_file(output, mimetype='image/png', download_name='nigel-wifi.png')
 
 @api_bp.route('/admin/devices/<path:mac_address>/kick', methods=['POST', 'DELETE'])
 @login_required
@@ -316,16 +545,60 @@ def kick_device(mac_address):
     if current_user.role != 'admin':
         return jsonify({'message': 'Unauthorized'}), 403
         
+    mac_address = _admin_mac(mac_address)
+    if not mac_address:
+        return jsonify({'message': 'Invalid MAC address'}), 400
     device = Device.query.filter_by(mac_address=mac_address).first()
     if device:
         device.is_authenticated = False
+        _audit('kick', f'mac={mac_address}', device.user_id)
         db.session.commit()
         network.remove_device_from_ipset(mac_address=mac_address, ip_address=device.ip_address)
+        _notify_device('kicked', mac_address)
         return jsonify({'message': f'Device {mac_address} kicked successfully'}), 200
         
     # Also remove from ipset directly
     network.remove_device_from_ipset(mac_address=mac_address)
     return jsonify({'message': f'Device {mac_address} removed from firewall'}), 200
+
+
+@api_bp.route('/admin/devices/<path:mac_address>/block', methods=['POST'])
+@login_required
+def block_device(mac_address):
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    mac_address = _admin_mac(mac_address)
+    if not mac_address:
+        return jsonify({'message': 'Invalid MAC address'}), 400
+    device = Device.query.filter_by(mac_address=mac_address).first()
+    if not device:
+        return jsonify({'message': 'Device not found'}), 404
+    device.is_blocked = True
+    device.is_authenticated = False
+    _audit('block', f'mac={mac_address}', device.user_id)
+    db.session.commit()
+    network.remove_device_from_ipset(mac_address=device.mac_address)
+    _notify_device('blocked', mac_address)
+    notify_devices_changed()
+    return jsonify({'message': 'Device blocked'}), 200
+
+
+@api_bp.route('/admin/devices/<path:mac_address>/unblock', methods=['POST'])
+@login_required
+def unblock_device(mac_address):
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    mac_address = _admin_mac(mac_address)
+    if not mac_address:
+        return jsonify({'message': 'Invalid MAC address'}), 400
+    device = Device.query.filter_by(mac_address=mac_address).first()
+    if not device:
+        return jsonify({'message': 'Device not found'}), 404
+    device.is_blocked = False
+    _audit('unblock', f'mac={mac_address}', device.user_id)
+    db.session.commit()
+    notify_devices_changed()
+    return jsonify({'message': 'Device unblocked'}), 200
 
 # User Management Endpoints
 @api_bp.route('/admin/users', methods=['GET', 'POST'])
@@ -338,7 +611,9 @@ def admin_users():
         users = User.query.all()
         return jsonify([{
             'id': u.id, 'username': u.username, 'role': u.role, 
-            'is_approved': u.is_approved, 'created_at': u.created_at.isoformat()
+            'is_approved': u.is_approved, 'created_at': u.created_at.isoformat(),
+            'quota_mb': u.quota_mb, 'time_window_start': u.time_window_start,
+            'time_window_end': u.time_window_end
         } for u in users]), 200
         
     if request.method == 'POST':
@@ -355,6 +630,37 @@ def admin_users():
         db.session.add(u)
         db.session.commit()
         return jsonify({'message': 'User created'}), 201
+
+
+@api_bp.route('/admin/users/<int:user_id>/limits', methods=['PUT'])
+@login_required
+def update_user_limits(user_id):
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'message': 'Not found'}), 404
+    data = request.get_json(silent=True) or {}
+    try:
+        quota = data.get('quota_mb')
+        user.quota_mb = None if quota in (None, '') else max(1, int(quota))
+    except (TypeError, ValueError):
+        return jsonify({'message': 'Invalid quota'}), 400
+    start = data.get('time_window_start') or None
+    end = data.get('time_window_end') or None
+    if (start is None) != (end is None):
+        return jsonify({'message': 'Both time-window values are required'}), 400
+    try:
+        if start:
+            clock_time.fromisoformat(start)
+            clock_time.fromisoformat(end)
+    except ValueError:
+        return jsonify({'message': 'Invalid time window'}), 400
+    user.time_window_start = start
+    user.time_window_end = end
+    _audit('limits_updated', f'user_id={user.id}', current_user.id)
+    db.session.commit()
+    return jsonify({'message': 'Limits updated'}), 200
 
 @api_bp.route('/admin/users/<int:user_id>/approve', methods=['POST'])
 @login_required
@@ -387,6 +693,23 @@ def approve_user(user_id):
         return jsonify({'message': 'Approved! Device access granted.'}), 200
     return jsonify({'message': 'Not found'}), 404
 
+
+@api_bp.route('/admin/users/<int:user_id>/reset-password', methods=['POST'])
+@login_required
+def admin_reset_password(user_id):
+    if current_user.role != 'admin':
+        return jsonify({'message': 'Unauthorized'}), 403
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'message': 'Not found'}), 404
+    temporary_password = secrets.token_urlsafe(18)
+    user.set_password(temporary_password)
+    user.must_change_password = True
+    _audit('password_reset', f'user_id={user.id}', current_user.id)
+    db.session.commit()
+    logging.getLogger(__name__).warning('Temporary password for %s: %s', user.username, temporary_password)
+    return jsonify({'message': 'Temporary password generated', 'temporary_password': temporary_password}), 200
+
 @api_bp.route('/admin/users/<int:user_id>', methods=['DELETE'])
 @login_required
 def delete_user(user_id):
@@ -415,11 +738,11 @@ def delete_user(user_id):
     return jsonify({'message': 'User deleted'}), 200
 
 # Voucher Management Endpoints
-import random
 import string
 
 def generate_voucher_code(length=8):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
+    alphabet = string.ascii_uppercase + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 @api_bp.route('/admin/vouchers', methods=['GET', 'POST'])
 @login_required
