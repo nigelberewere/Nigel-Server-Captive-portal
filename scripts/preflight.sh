@@ -40,7 +40,14 @@ fi
 
 if command -v iptables-restore >/dev/null 2>&1; then
   printf 'iptables: %s\n' "$(iptables --version 2>/dev/null || true)"
-  check 'iptables-restore nft syntax' bash -c 'printf "%s\\n" "*nat" ":NIGEL_PREFLIGHT - [0:0]" "-A NIGEL_PREFLIGHT -m set --match-set nigel_auth_macs src -j RETURN" "COMMIT" | iptables-restore --test --noflush'
+  check 'iptables-restore nft syntax' bash -c '
+    probe="nigel_preflight_${BASHPID}"
+    cleanup() { ipset destroy "$probe" 2>/dev/null || true; }
+    trap cleanup EXIT
+    ipset create "$probe" hash:mac -exist
+    printf "%s\\n" "*nat" ":NIGEL_PREFLIGHT - [0:0]" "-A NIGEL_PREFLIGHT -m set --match-set $probe src -j RETURN" "COMMIT" |
+      iptables-restore --test --noflush
+  '
 else
   check 'iptables-restore installed' false
 fi
