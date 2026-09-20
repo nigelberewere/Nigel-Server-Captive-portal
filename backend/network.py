@@ -250,19 +250,7 @@ def _configure_chains():
             continue
         _ensure_chain(table, chain, parent)
 
-    probe_tokens = (
-        "generate_204", "gen_204", "hotspot-detect.html", "success.html",
-        "success.txt", "canonical.html", "connecttest.txt", "ncsi.txt",
-        "connectivitycheck.gstatic.com", "captive.apple.com", "appleiphonecell.com",
-        "airport.us", "msftconnecttest.com", "msftncsi.com",
-    )
-    probe_rules = [
-        f'-i {iface} -p tcp --dport 80 -m string --algo bm --string "{token}" -j REDIRECT --to-ports 5000'
-        for token in probe_tokens
-    ]
-    _restore("nat", "NIGEL_NAT", probe_rules + [
-        f"-i {iface} -m set --match-set {IPSET_TRUSTED_NAME} src -j RETURN",
-        f"-i {iface} -m set --match-set {IPSET_MAC_NAME} src -j RETURN",
+    _restore("nat", "NIGEL_NAT", [
         f"-i {iface} -p tcp --dport 80 -j REDIRECT --to-ports 5000",
     ])
     input_rules = [

@@ -113,9 +113,10 @@ def create_app(config_object=None):
         if host_without_port in app.config['PORTAL_HOSTS'] or host_without_port == 'nigel.local':
             return None
 
-        # If authenticated, do NOT redirect foreign requests (handled by iptables)
+        # Port 80 is redirected to Flask for every hotspot client. Authenticated
+        # normal browsing gets the Hub SPA; unauthenticated browsing gets login.
         if is_auth:
-            return None
+            return app.send_static_file('index.html')
 
         # If unauthenticated and accessing external domain, redirect to captive portal
         return redirect(f"{app.config['PORTAL_ORIGIN']}/", code=302)
