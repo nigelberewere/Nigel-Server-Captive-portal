@@ -9,8 +9,10 @@ ENV_FILE=/etc/nigel/nigel.env
 : "${NIGEL_WIFI_PREFIX:?NIGEL_WIFI_PREFIX is missing}"
 : "${NIGEL_ROOT:?NIGEL_ROOT is missing}"
 : "${NIGEL_STATE_DIR:?NIGEL_STATE_DIR is missing}"
+: "${NIGEL_CONFIG_DIR:?NIGEL_CONFIG_DIR is missing}"
 : "${NIGEL_WIFI_SUBNET:?NIGEL_WIFI_SUBNET is missing}"
-DNSMASQ_CONF="$NIGEL_STATE_DIR/dnsmasq.conf"
+DNSMASQ_CONF="$NIGEL_CONFIG_DIR/dnsmasq.conf"
+HOSTAPD_CONF="$NIGEL_CONFIG_DIR/hostapd.conf"
 
 require_root() { [[ $EUID -eq 0 ]] || { echo 'Run as root.' >&2; exit 1; }; }
 
@@ -122,6 +124,7 @@ ap_on() {
   ip link set dev "$WIFI_IFACE" up
   wait_for_address || rollback_client
   sysctl -w "net.ipv6.conf.$WIFI_IFACE.disable_ipv6=1" >/dev/null
+  [[ -r "$HOSTAPD_CONF" ]] || { echo "Missing hostapd config: $HOSTAPD_CONF" >&2; rollback_client; }
   dnsmasq --test --conf-file="$DNSMASQ_CONF" --conf-dir= || rollback_client
   if ! systemctl start nigel-hostapd.service; then
     journalctl -u nigel-hostapd.service -n 50 --no-pager || true

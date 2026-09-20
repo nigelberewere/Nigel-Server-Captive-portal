@@ -130,6 +130,7 @@ enable_phase() {
     write_env_value NIGEL_STRICT '1'
     write_env_value WIFI_SSID "$ssid"
     write_env_value WIFI_PASSPHRASE_FILE '/etc/nigel/wifi-passphrase'
+    write_env_value NIGEL_CONFIG_DIR "$STATE_DIR"
     write_env_value PORTAL_ORIGIN "http://$wifi_ip:5000"
     write_env_value NIGEL_STATE_DIR '/var/lib/nigel-server'
     write_env_value NIGEL_ROOT "$ROOT_DIR"
@@ -145,10 +146,10 @@ enable_phase() {
 
   envsubst < "$ROOT_DIR/config_templates/dnsmasq.conf" > "$STATE_DIR/dnsmasq.conf"
   envsubst < "$ROOT_DIR/config_templates/hostapd.conf" > "$STATE_DIR/hostapd.conf"
-  if [[ -n $WIFI_PASSPHRASE ]]; then
+  if [[ -n $passphrase ]]; then
     cat >> "$STATE_DIR/hostapd.conf" <<EOF
 wpa=2
-wpa_passphrase=$WIFI_PASSPHRASE
+wpa_passphrase=$passphrase
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
 EOF
