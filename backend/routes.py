@@ -139,6 +139,7 @@ def auth_status():
         'authenticated': is_auth,
         'role': role,
         'username': username,
+        'must_change_password': bool(current_user.is_authenticated and current_user.must_change_password),
         'ip': client_ip,
         'mac': mac_address
     }), 200
@@ -207,7 +208,7 @@ def login():
             return jsonify({'message': 'This device is blocked'}), 403
         if user.role == 'admin' and user.must_change_password:
             login_user(user)
-            return jsonify({'message': 'Password change required', 'must_change_password': True}), 200
+            return jsonify({'message': 'Password change required', 'role': user.role, 'must_change_password': True}), 200
 
         login_user(user)
 

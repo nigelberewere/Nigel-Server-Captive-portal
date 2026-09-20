@@ -21,6 +21,12 @@ const router = createRouter({
   routes
 })
 
+router.beforeEach((to) => {
+  if (sessionStorage.getItem('nigel-password-change-required') === '1' && to.path !== '/login') {
+    return '/login'
+  }
+})
+
 const app = createApp(App)
 app.use(router)
 app.mount('#app')

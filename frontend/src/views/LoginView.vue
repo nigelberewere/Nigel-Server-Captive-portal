@@ -35,6 +35,20 @@
         </div>
       </form>
 
+      <form @submit.prevent="handleForcedPasswordChange" v-if="mode === 'forced-password'">
+        <p class="text-muted">Your administrator account requires a new password before you can continue.</p>
+        <div class="input-group mt-4">
+          <label>New password</label>
+          <input type="password" v-model="forcedPassword" minlength="12" required autofocus />
+        </div>
+        <div class="input-group">
+          <label>Confirm new password</label>
+          <input type="password" v-model="forcedPasswordConfirm" minlength="12" required />
+        </div>
+        <div v-if="errorMsg" class="error-msg">{{ errorMsg }}</div>
+        <button type="submit" class="btn w-full mt-4" :disabled="loading">Change password</button>
+      </form>
+
       <form @submit.prevent="handlePasswordReset" v-if="mode === 'reset'">
         <div class="input-group">
           <label>Username</label>
@@ -128,8 +142,21 @@ const loginData = ref({ username: '', password: '' })
 const voucherCode = ref('')
 const requestData = ref({ username: '', password: '' })
 const resetData = ref({ username: '', token: '', password: '' })
+const forcedPassword = ref('')
+const forcedPasswordConfirm = ref('')
 
 const urlParams = new URLSearchParams(window.location.search);
+
+function redirectForRole(role) {
+  router.push(role === 'admin' ? '/admin' : '/hub')
+}
+
+function enterForcedPasswordMode(role) {
+  sessionStorage.setItem('nigel-password-change-required', '1')
+  sessionStorage.setItem('nigel-password-change-role', role || 'user')
+  mode.value = 'forced-password'
+  clearMessages()
+}
 
 function setMode(newMode) {
   mode.value = newMode
@@ -149,8 +176,8 @@ async function checkAuthStatus() {
       const data = await res.json()
       if (data.authenticated) {
         if (approvalWatcherTimer) clearInterval(approvalWatcherTimer)
-        if (data.role === 'admin') router.push('/admin')
-        else router.push('/hub')
+        if (data.must_change_password) enterForcedPasswordMode(data.role)
+        else redirectForRole(data.role)
       }
     }
   } catch (err) {}
@@ -164,6 +191,7 @@ function startApprovalWatcher() {
 
 onMounted(() => {
   loadPortalConfig()
+  if (sessionStorage.getItem('nigel-password-change-required') === '1') mode.value = 'forced-password'
   checkAuthStatus()
   try {
     socket = io()
@@ -191,11 +219,46 @@ async function handleLogin() {
     })
     const data = await res.json()
     if (res.ok) {
-      if (data.role === 'admin') router.push('/admin')
-      else router.push('/hub')
+      if (data.must_change_password) enterForcedPasswordMode(data.role)
+      else redirectForRole(data.role)
     } else {
       errorMsg.value = data.message || 'Login failed'
     }
+  } catch (err) {
+    errorMsg.value = 'Network error. Could not reach server.'
+  } finally {
+    loading.value = false
+  }
+}
+
+async function handleForcedPasswordChange() {
+  clearMessages()
+  if (forcedPassword.value.length < 12) {
+    errorMsg.value = 'Password must be at least 12 characters.'
+    return
+  }
+  if (forcedPassword.value !== forcedPasswordConfirm.value) {
+    errorMsg.value = 'Passwords do not match.'
+    return
+  }
+  loading.value = true
+  try {
+    const res = await fetch('/api/auth/password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: forcedPassword.value })
+    })
+    const data = await res.json()
+    if (!res.ok) {
+      errorMsg.value = data.message || 'Password change failed'
+      return
+    }
+    sessionStorage.removeItem('nigel-password-change-required')
+    const role = sessionStorage.getItem('nigel-password-change-role')
+    sessionStorage.removeItem('nigel-password-change-role')
+    forcedPassword.value = ''
+    forcedPasswordConfirm.value = ''
+    redirectForRole(role)
   } catch (err) {
     errorMsg.value = 'Network error. Could not reach server.'
   } finally {
